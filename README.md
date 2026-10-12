@@ -1,0 +1,287 @@
+# pytorch-fdwt
+
+Fast 1D wavelet transforms for PyTorch, written as fused Triton kernels (forward and
+backward), for use as differentiable layers, in particular as an O(N) replacement for
+self-attention in transformers that process biological signals.
+
+| | |
+|---|---|
+| `fdwt.dwt / idwt / wavedec / waverec`, `DWT1D`, `IDWT1D` | Mallat fast wavelet transform, O(N). Coefficients identical to PyWavelets (all `pywt` filter banks, 5 boundary modes). |
+| `fdwt.cwt`, `CWT1D` | Continuous wavelet transform with the complex Morlet wavelet. The default `method="fast"` octave pyramid costs O(N) per scale. Optionally learnable scales and `w0`. |
+| `MorletTokenMixer` | Attention replacement: per-channel Morlet scalogram → learned mix of magnitudes/phases. A fused kernel never stores the scalogram, so activation memory is O(L·dim). |
+| `WaveletTokenMixer` | Attention replacement: DWT → per-band channel MLP → inverse DWT. |
+| `MorletAttention` | For multi-channel patch tokens `(B, H, C, T, D)`: at every position, a softmax over each channel's local Morlet spectrum weights that channel's learned per-frequency values. Frequencies and wave number are learned. Fused: the scalogram is never stored. |
+| `MorletChannelMixAttention` | Same input. The softmaxed spectrum and a learned frequency → channel matrix form a per-time-step C×C channel-attention map, applied to the input. Fused the same way. |
+
+Every operator runs on CUDA through Triton and falls back to plain PyTorch on CPU (also used
+as the test oracle). Any leading dimensions are batch dimensions, and the transform acts on
+the last one.
+
+## Install
+
+```bash
+pip install -e .            # torch>=2.3, triton>=3.0, PyWavelets, numpy
+pip install -e ".[test]" && pytest
+```
+
+## Quick start
+
+```python
+import torch, fdwt
+
+x = torch.randn(32, 64, 2500, device="cuda")            # (batch, EEG channels, samples)
+
+# --- discrete: identical to pywt.wavedec(x, "db4", mode="symmetric", level=5)
+coeffs = fdwt.wavedec(x, "db4", mode="symmetric", level=5)  # [cA5, cD5, ..., cD1]
+x_rec = fdwt.waverec(coeffs, "db4", mode="symmetric")
+
+# --- continuous Morlet transform, 40 frequencies between 0.5 and 100 Hz at fs = 250 Hz
+cwt = fdwt.CWT1D(freqs=torch.logspace(-0.3, 2, 40), fs=250.0).cuda()
+W = cwt(x)                       # (32, 64, 40, 2500) complex64
+power = W.abs() ** 2
+
+# learnable centre frequencies (and wave number)
+cwt = fdwt.CWT1D(freqs=torch.logspace(0, 1.8, 16), fs=250.0, learnable=True, learnable_w0=True)
+
+# --- attention replacement, (batch, length, dim) -> (batch, length, dim)
+mixer = fdwt.MorletTokenMixer(dim=256, freqs=torch.logspace(0, 1.8, 16).tolist(), fs=250.0).cuda()
+y = mixer(torch.randn(8, 4096, 256, device="cuda"))
+```
+
+```python
+# --- channel attention on patch tokens: 19 EEG channels, 30 one-second patches of D = 200
+attn = fdwt.MorletAttention(num_channels=19, hidden_dim=200).cuda()   # fs = D / 1 s = 200 Hz
+x = torch.randn(8, 4, 19, 30, 200, device="cuda")                     # (B, H, C, T, D)
+y = attn(x)                                                           # same shape
+attn.freqs                                                            # learned centre frequencies (Hz)
+mix = fdwt.MorletChannelMixAttention(num_channels=19, hidden_dim=200).cuda()
+```
+
+`examples/token_mixer_demo.py` trains a 2-block transformer on a synthetic burst
+classification task (1000 samples, 4 classes) with each mixer:
+
+| mixer | test acc. | ms / step | peak train mem |
+|---|---|---|---|
+| `MorletTokenMixer` (fused) | 0.988 | 12.3 | 322 MiB |
+| `WaveletTokenMixer` (db4) | 0.988 | 4.7 | 153 MiB |
+| `nn.MultiheadAttention` | 0.244 | 18.5 | 178 MiB |
+
+In the Morlet run, the learnable centre frequencies move onto the class frequencies
+(6, 10, 18, 30 Hz).
+
+## Design
+
+### Discrete transform (`fdwt/kernels/dwt.py`)
+
+One DWT level is a linear *analysis* operator
+`y0[o] = Σ_j h0[j]·x_ext[2o + OFF − j]` (and `y1` with `h1`). Here `x_ext` is the signal
+extended by the boundary mode (`zero`, `periodic`, `symmetric`, `reflect`,
+`periodization`), computed with index arithmetic inside the kernel. One fused kernel does
+the extension, both filters and the down-sampling, so `x` is read once and both sub-bands
+are written once.
+
+A second kernel applies the **exact transpose** of that operator: up-sampling, filtering,
+summing the sub-bands and folding the boundary extension back onto the signal. Each lane
+only visits the taps of its parity (L/2 instead of L). Only boundary tiles run the
+folding passes, so interior tiles cost the same as a plain convolution. This one kernel
+serves two roles:
+
+* it is the backward pass of the DWT, in every mode;
+* it is the inverse DWT, because `pywt.idwt` is exactly the transpose of an analysis
+  operator built from the time-reversed reconstruction filters (`zero` mode cropped to
+  `2·n − L + 2`, or `periodization`).
+
+Symmetrically, the analysis kernel is the backward pass of the IDWT. So each autograd node,
+forward or backward, is one launch per level, and double-backward works for free. The
+multilevel transform is O(N) overall and memory-bound: 450–600 GB/s on an RTX 4080 SUPER.
+
+### Continuous Morlet transform (`fdwt/cwt.py`, `fdwt/kernels/conv.py`)
+
+```
+W[s, n] = Σ_m x[m] · conj(ψ((m − n)/s)) / norm(s),   ψ(t) = π^-¼ (e^{iω0 t} − e^{−ω0²/2}) e^{−t²/2}
+```
+
+with `norm = √s` (`"l2"`) or `s` (`"l1"`, scale-independent amplitude for sinusoids), zero
+padding, and the envelope truncated at `truncate` σ (default 4). Frequencies map to scales
+through `s = ω0·fs / (2π f)`.
+
+* **`method="direct"`** is the exact sampled convolution. Its cost grows with the scale:
+  O(N·Σ_s s).
+* **`method="fast"`** (default) uses an octave pyramid (the *algorithme à trous*). Scale
+  `s` goes to octave `j = ⌊log2(s/s_th)⌋`, with `s_th = (ω0 + truncate)/(0.8π)`. Octave
+  `j` convolves `x_j` with Morlet filters sampled at spacing `2^j`, i.e. dilated by
+  `2^j`. Here `x_j` is `x` passed through `j` dilated half-band low-pass filters (a
+  33-tap Kaiser-windowed half-band). Each filter keeps ≤ ~65 taps whatever its scale,
+  so the cost is **O(N) per scale**.
+
+  The anti-aliasing condition keeps the Morlet band below 0.8π at every octave, so the
+  dilated filters' spectral images fall in the low-pass stop band. Each `x_j` is
+  materialised with exactly the margin that later octaves need, which keeps the
+  zero-padded boundary exact.
+
+  Scales of octave 0 are identical to `direct` (to rounding). Coarser scales match `direct` to
+  ~1e-4 relative error, or ~5e-6 with `truncate=5`, which also selects a 49-tap
+  half-band.
+* **`method="fft"`** applies the same filters as `direct` through FFTs (pure PyTorch).
+
+All octaves run in **one autograd node**:
+
+| kernel | what it does |
+|---|---|
+| forward | Register-tiled outer product over (scales × time); every thread stores its (re, im) pairs, so stores are fully coalesced. Scales are grouped into blocks of similar support, and each block visits only its own tap range. Blocks of ≥ 8 complex scales use a tensor-core variant on a Hankel tile of `x`. Tiles that lie entirely inside the signal skip bounds checks. |
+| grad x | Toeplitz form `acc[u, (phase,row)] += T[u, v] @ G[v, (phase,row)]` with `T[u, v] = h[v − u]`. A polyphase-blocked tile makes dilated filters as cheap and coalesced as undilated ones. |
+| grad h | Gradient for learnable scales / `w0`: a (filters × taps) tile reduced over rows and time on tensor cores, in 3×TF32 (split hi/lo operands, fp32 accuracy). |
+| low-pass chain | The same kernels with a single real filter. |
+
+**Fused mixer** (`fdwt/kernels/mix.py`). The forward kernel computes each scalogram tile
+in registers and immediately reduces it to `Σ_s a[d,s]·|W_s| + b[d,s]·Re W_s` (an
+epilogue with atomic adds), so only `(B, D, L)` is ever written. The backward pass
+recomputes one octave at a time, in row chunks of ≤ 256 MB. It forms `dL/dW`, accumulates
+`dL/da` and `dL/db`, then reuses the grad-x / grad-h kernels.
+
+### `MorletAttention` and `MorletChannelMixAttention`
+
+The `(T, D)` axes are flattened into one signal per channel, sampled at
+`fs = D / patch_duration` Hz. With `x_c` the flattened channel `c` and
+`P[c, n, f] = softmax_f |W_f x_c|(n) / temperature`:
+
+```
+MorletAttention:            out[c, n] = Σ_f P[c, n, f] · w[c, f]                     w: learned (C, f)
+MorletChannelMixAttention:  out[c, n] = Σ_c' A[n, c, c'] · x_c'[n],
+                            A[n, c, c'] = Σ_f P[c, n, f] · M[f, c']                  M: learned (f, C)
+```
+
+`MorletAttention` outputs, at every position, a convex combination of channel `c`'s
+learned per-frequency values. It does not mix channels; it acts as a learned descriptor
+of which frequencies dominate locally.
+
+`MorletChannelMixAttention` never forms `A`. Its output is
+`out[c, n] = Σ_f P[c, n, f] · U[f, n]` with `U = M·x`, which costs O(T·D·C·f) instead of
+O(T·D·C²). `attention_map(x)` returns the explicit `A` for inspection.
+
+Both therefore reduce to `out = Σ_f softmax_f(|W_f x| / τ) · V_f`, with `V = w`
+(per channel) or `V = U` (per position). On CUDA that is a single fused operator
+(`fdwt/kernels/softmax.py`):
+
+* **Forward.** A frequency's coefficients come from one octave of the CWT pyramid, i.e.
+  one kernel launch. Within an octave they are computed on tensor cores as a banded
+  Toeplitz product: the filter band (built once per octave as small dense tiles) times a
+  (time × rows) tile of the signal. Each program then folds the frequencies into a
+  flash-attention style online softmax `(max, denominator, numerator)`, carried from one
+  octave launch to the next in three `(B·H·C, T·D)` buffers. The scalogram is never
+  written, and very large `|W|/τ` cannot overflow.
+* **Backward.** The low-passed octave signals are recomputed rather than stored, so only
+  the input and the three softmax buffers are kept between forward and backward. The
+  scalogram is recomputed one octave at a time, in row chunks of ≤ 256 MB. The softmax
+  probabilities are rebuilt from the saved max and denominator. `dL/dV` is accumulated
+  with atomics, and `dL/dW` is fed to the grad-x / grad-h kernels of the transform.
+
+B=8, H=4, C=19, D=200, 16 frequencies, learnable scales and `w0`
+(`python benchmarks/attention_bench.py`). "Saved" is the activation memory held between
+forward and backward, which is what accumulates across the layers of a deep network:
+
+| T (tokens) | | fwd | fwd+bwd | saved | step peak |
+|---|---|---|---|---|---|
+| 30 (570) | `MorletAttention`, fp32 | 3.6 ms | 14.9 ms | 29 MiB | 260 MiB |
+| | `MorletAttention`, bf16 tensor cores | 2.7 ms | 10.2 ms | 28 MiB | 260 MiB |
+| | `MorletChannelMixAttention`, bf16 | 3.0 ms | 11.7 ms | 54 MiB | 297 MiB |
+| | FlashAttention block (QKV + out proj.), bf16 | 0.35 ms | 1.2 ms | 36 MiB | 109 MiB |
+| 120 (2 280) | `MorletAttention`, bf16 | 9.1 ms | 36 ms | 112 MiB | 850 MiB |
+| | FlashAttention block, bf16 | 2.6 ms | 10.8 ms | 143 MiB | 429 MiB |
+
+At these sequence lengths FlashAttention is faster. The Morlet modules scale linearly in
+T and attention quadratically, so the gap narrows with longer recordings.
+
+### Precision
+
+Inputs in fp32 are computed in fp32. fp16 / bf16 are computed in fp32: DWT outputs keep
+the input dtype, CWT outputs are complex64. fp64 is computed in fp64, which the gradient
+tests use.
+
+Tensor-core dots default to full fp32 accuracy (`"ieee"`, or a hand-written 3×TF32 split
+for the filter gradient). Two switches trade accuracy for speed:
+
+| | dot operands | rel. error | speed-up (`MorletAttention` step) |
+|---|---|---|---|
+| default | fp32 | ~1e-6 | 1× |
+| `fdwt.config.allow_tf32 = True` | TF32 | ~1e-3 | ~1.3× |
+| `fdwt.config.allow_bf16 = True`, or bf16 / fp16 inputs | bf16, fp32 accumulation | ~5e-3 | ~1.45× |
+
+Accumulation, softmax statistics and all elementwise work stay in fp32 in every mode.
+
+## Benchmarks
+
+RTX 4080 SUPER, fp32, `python benchmarks/bench.py`. `ptwt` is `pytorch_wavelets` 1.3
+(cuDNN-based).
+
+**DWT** — `wavedec` to the maximum level, 2048 rows × 4096 samples:
+
+| wavelet | mode | fdwt fwd | fdwt fwd+bwd | ptwt fwd | ptwt fwd+bwd | fdwt GB/s |
+|---|---|---|---|---|---|---|
+| haar | periodization | 0.17 ms | 0.53 ms | 0.55 ms | 1.55 ms | 604 |
+| db4 | symmetric | 0.18 ms | 0.54 ms | 1.01 ms | 2.52 ms | 552 |
+| sym8 | symmetric | 0.23 ms | 0.67 ms | 1.08 ms | 2.88 ms | 440 |
+| coif5 | zero | 0.24 ms | 0.69 ms | 0.60 ms | 2.67 ms | 425 |
+
+64 rows × 262144 samples, db4 symmetric: 0.41 / 1.24 ms (fdwt) vs 3.37 / 10.3 ms (ptwt).
+
+**Morlet CWT** — 40 frequencies, 0.5–100 Hz at 250 Hz, complex64 output:
+
+| method | 512 × 2500 fwd | fwd+bwd | 64 × 15000 fwd | fwd+bwd |
+|---|---|---|---|---|
+| fdwt `fast` | 1.97 ms | 4.75 ms | 1.30 ms | 3.43 ms |
+| fdwt `fast`, learnable scales | | 8.64 ms | | 6.18 ms |
+| fdwt `direct` (exact) | 12.9 ms | 25.7 ms | 9.37 ms | 23.7 ms |
+| fdwt `fft` (PyTorch) | 18.0 ms | 43.3 ms | 9.88 ms | 23.7 ms |
+| PyTorch `conv1d` (same filters) | 58.2 ms | 179 ms | 43.8 ms | 140 ms |
+
+The 512 × 2500 output alone is 0.41 GB, so a write-only roofline is ~0.6 ms.
+
+**Token mixers vs attention** — batch 8, dim 64, fwd+bwd time / peak memory:
+
+| L | `MorletTokenMixer` (16 scales) | `WaveletTokenMixer` (db4, 4 levels) | `nn.MultiheadAttention` (SDPA) |
+|---|---|---|---|
+| 1 024 | 3.4 ms / 387 MiB | 0.58 ms / 289 MiB | 2.6 ms / 311 MiB |
+| 4 096 | 9.1 ms / 554 MiB | 0.54 ms / 331 MiB | 33.7 ms / 420 MiB |
+| 16 384 | 33.5 ms / 1162 MiB | 1.49 ms / 499 MiB | 525 ms / 855 MiB |
+| 65 536 | 137 ms / 2643 MiB | 7.8 ms / 1171 MiB | 8320 ms / 2595 MiB |
+
+Both wavelet mixers scale linearly with L, while attention scales quadratically.
+
+## Tests
+
+`pytest` (129 tests, ~30 s on GPU):
+
+* **PyWavelets parity:** DWT/IDWT/wavedec/waverec against pywt to 1e-12, for 7 wavelets
+  × 5 modes and lengths 1…4097, on GPU and CPU.
+* **Gradients:** `gradcheck` and `gradgradcheck` of every DWT/IDWT mode; `gradcheck` of
+  the CWT with respect to the input, the scales and `w0`, for direct/fast and
+  complex/real; the fused mixer with respect to the input, the mixing weights and the
+  scales; `MorletAttention` and `MorletChannelMixAttention` against literal
+  implementations of their definitions (explicit `(C, f, 1)` product and C×C map), with
+  forced row chunking; `gradcheck` of the fused spectral softmax; numerical stability at
+  very large `|W|/τ`.
+* **CWT correctness:** the CWT against its literal O(N²) definition; the three methods
+  against each other; Triton against the PyTorch reference at 1e-10 in fp64, including
+  deep octaves with large dilations.
+* **Precision and physics:** fp32/fp16/bf16 accuracy; frequency localisation and l1
+  amplitude flatness on sinusoids.
+
+## Notes and limitations
+
+* **No Morlet DWT.** The Morlet wavelet has no finite two-channel filter bank (it is
+  neither orthogonal nor compactly supported), so a Mallat DWT "with Morlet" does not
+  exist. `pywt.Wavelet("morl")` cannot be used for `pywt.dwt` either. The Morlet
+  transform here is the CWT, made O(N) per scale by the octave pyramid. Use
+  `CWT1D(..., scales=2**k)` with one scale per octave for a dyadic Morlet transform.
+  The DWT supports every PyWavelets filter bank (`haar`, `dbN`, `symN`, `coifN`,
+  `biorN.M`, …), with `db4` as the default.
+* **Fixed plan with learnable scales.** The octave assignment and the filter supports are
+  fixed when the module is built, with a 25% support margin when `learnable=True`. Scales
+  that drift far from their initial values are truncated more aggressively.
+* **CWT boundaries.** The CWT zero-pads. For other boundary handling, pad the input
+  (`F.pad(..., mode="reflect")`) and crop the output.
+* **`torch.compile`.** The custom autograd Functions launch Triton kernels directly, so
+  `torch.compile` graph-breaks around them, which is harmless.
+* **JIT compilation.** The first call of each kernel configuration JIT-compiles it, which
+  takes a few seconds.

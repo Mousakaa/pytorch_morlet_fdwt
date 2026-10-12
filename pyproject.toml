@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytorch-fdwt"
+version = "0.1.0"
+description = "Fast 1D discrete (Mallat) and continuous (Morlet) wavelet transforms for PyTorch, with fused Triton kernels"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Arthur Gaudard", email = "arthur.gaudard@imt-atlantique.fr" }]
+dependencies = ["torch>=2.3", "triton>=3.0", "PyWavelets>=1.4", "numpy"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
