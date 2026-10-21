@@ -40,12 +40,13 @@ import torch
 import triton
 from torch import nn
 
-from . import reference
+from . import config, reference
 from .kernels import conv as KC
 from .kernels import mix as KM
 from .kernels import softmax as KS
 
-__all__ = ["cwt", "CWT1D", "MorletPlan", "freqs_to_scales", "scales_to_freqs"]
+__all__ = ["cwt", "CWT1D", "MorletPlan", "freqs_to_scales", "scales_to_freqs", "spectral_softmax",
+           "spectral_softmax_params"]
 
 _PI_M14 = math.pi ** -0.25
 _BLOCK_F = 16  # filters per program in the forward kernel (8 complex scales)
@@ -87,7 +88,7 @@ class MorletPlan:
 
     def __init__(self, scales: Sequence[float], w0: float = 6.0, truncate: float = 4.0,
                  norm: str = "l2", complex: bool = True, method: str = "fast",
-                 support_margin: float = 1.0):
+                 support_margin: float = 1.0, octaves: Optional[Sequence[int]] = None):
         if method not in ("fast", "direct", "fft"):
             raise ValueError(f"unknown method '{method}' (expected 'fast', 'direct' or 'fft')")
         if norm not in ("l1", "l2"):
@@ -97,15 +98,21 @@ class MorletPlan:
             raise ValueError("scales must be a non-empty sequence of positive numbers")
         self.scales, self.w0, self.truncate, self.norm = scales, float(w0), float(truncate), norm
         self.complex, self.method = bool(complex), method
+        self.support_margin = float(support_margin)
         self.channels = 2 if complex else 1
         reach = truncate * support_margin
+        if octaves is not None and (len(octaves) != len(scales) or min(octaves) < 0):
+            raise ValueError("octaves must hold one non-negative octave index per scale")
 
         # octave j holds the scales in [2^j s_th, 2^(j+1) s_th): after j half-band
         # low-pass stages the Morlet band (w0 +- truncate)/s' must stay below 0.8 pi.
         self.s_th = (w0 + truncate) / (0.8 * math.pi)
         groups: Dict[int, List[int]] = {}
         for i, s in enumerate(scales):
-            j = 0 if method != "fast" else max(0, math.floor(math.log2(s / self.s_th)))
+            if octaves is not None:
+                j = int(octaves[i]) if method == "fast" else 0
+            else:
+                j = 0 if method != "fast" else max(0, math.floor(math.log2(s / self.s_th)))
             groups.setdefault(j, []).append(i)
         self.stages: List[_Stage] = []
         for j in sorted(groups):
@@ -141,6 +148,15 @@ class MorletPlan:
     @property
     def num_scales(self) -> int:
         return len(self.scales)
+
+    @property
+    def octaves(self) -> List[int]:
+        """Octave (pyramid level) of every scale, in user order."""
+        out = [0] * len(self.scales)
+        for st in self.stages:
+            for i in st.scale_idx:
+                out[i] = st.octave
+        return out
 
     def static_tensors(self, device: torch.device) -> list:
         """Per stage ``(kb, cmap, block_s, kf, rows, cols)``: tap range per scale block,
@@ -187,9 +203,14 @@ class MorletPlan:
         dev = scales.device
         f64 = torch.float64
         s = scales.to(f64)[:, None]
-        dil = torch.tensor(self._dil, dtype=f64, device=dev)[:, None]
-        sup = torch.tensor(self._sup, dtype=f64, device=dev)[:, None]
-        k = torch.arange(-self.center, self.center + 1, device=dev, dtype=f64)[None, :]
+        key = ("grid", dev)
+        if key not in self._static_cache:  # host -> device copies would sync the stream
+            self._static_cache[key] = (
+                torch.tensor(self._dil, dtype=f64, device=dev)[:, None],
+                torch.tensor(self._sup, dtype=f64, device=dev)[:, None],
+                torch.arange(-self.center, self.center + 1, device=dev, dtype=f64)[None, :],
+            )
+        dil, sup, k = self._static_cache[key]
         t = k * dil / s
         env = torch.exp(-0.5 * t * t) * (k.abs() <= sup)
         # a dilated sum approximates the Riemann sum with spacing `dil`
@@ -201,6 +222,22 @@ class MorletPlan:
             return re.to(dtype)
         im = torch.sin(w0t) * env * amp
         return torch.stack([re, im], 1).reshape(-1, k.shape[1]).to(dtype)
+
+
+    def filter_tangents(self, log_scales: torch.Tensor, w0, dtype: torch.dtype,
+                        wrt_scales: bool = True, wrt_w0: bool = True) -> List[torch.Tensor]:
+        """Derivatives of :meth:`filters` (``exp(log_scales)``, ``w0``), each shaped like it:
+        dH/dlog s (row ``i*C + c`` w.r.t. its own scale ``i``) and dH/dw0."""
+        f64 = torch.float64
+        ls = log_scales.detach().to(f64)
+        w = torch.as_tensor(w0, dtype=f64, device=ls.device).detach()
+        fn = lambda a, b: self.filters(a.exp(), b, f64)
+        out = []
+        if wrt_scales:
+            out.append(torch.func.jvp(fn, (ls, w), (torch.ones_like(ls), torch.zeros_like(w)))[1])
+        if wrt_w0:
+            out.append(torch.func.jvp(fn, (ls, w), (torch.zeros_like(ls), torch.ones_like(w)))[1])
+        return [t.to(dtype) for t in out]
 
 
 # --------------------------------------------------------------------------- GPU path
@@ -394,119 +431,230 @@ def morlet_mix(x: torch.Tensor, plan: MorletPlan, H: torch.Tensor, a: torch.Tens
     return torch.einsum("bdsn,ds->bdn", mag, a.to(mag.dtype)) + torch.einsum("bdsn,ds->bdn", re, b.to(mag.dtype))
 
 
-class _SpectralSoftmaxFunction(torch.autograd.Function):
-    """out[r, n] = sum_f softmax_f(|W_f x_r|(n) / tau) * V_f[r, n], without materialising W.
+def _ss_v_layout(V):
+    if V.dim() == 2:  # (NCH, S)
+        return (0, V.shape[1], 1, 0), False
+    return (V.shape[1] * V.shape[2], 0, V.shape[2], 1), True  # (G, S, N)
 
-    ``V`` is ``(NCH, S)`` (per channel, row r uses ``V[r % NCH]``) or ``(G, S, N)`` (per
-    position, row r uses ``V[r // NCH]``).  The forward keeps a flash-attention style
-    online softmax across octave launches; the backward recomputes one octave at a time.
+
+def _ss_stage_filters(plan, H, stat):
+    return [H.index_select(0, rows)[:, cols].contiguous() for *_, rows, cols in stat]
+
+
+def _ss_forward(x, plan: MorletPlan, H, V, nch: int, tau: float, precision: str):
+    """Forward of the spectral softmax: ``(out, m, l, V_, tiles)``."""
+    if not plan.complex:
+        raise ValueError("the spectral softmax needs the complex Morlet transform")
+    R, N = x.shape
+    dt = _out_dtype(x.dtype)
+    stat, _ = plan.static_tensors(x.device)
+    V_ = V.to(dt).contiguous()
+    v_strides, v_pos = _ss_v_layout(V_)
+    hs = _ss_stage_filters(plan, H, stat)
+    tiles = [KS.band_tiles(h.detach(), st_[3], N, 2 ** plan.stages[k].octave, precision)
+             for k, (h, st_) in enumerate(zip(hs, stat))]
+    m = torch.full((R, N), float("-inf"), device=x.device, dtype=dt)
+    l = torch.zeros((R, N), device=x.device, dtype=dt)
+    num = torch.zeros((R, N), device=x.device, dtype=dt)
+    xj = x
+    by_oct = {st.octave: k for k, st in enumerate(plan.stages)}
+    for j in range(plan.n_octaves):
+        dil, mj = 2 ** j, plan.margins[j]
+        if j in by_oct:
+            k = by_oct[j]
+            _, gidx, _, kf = stat[k][:4]
+            KS.forward_stage(xj, tiles[k], kf, gidx, V_, v_strides, v_pos, nch, 1.0 / tau,
+                             mj + plan.stages[k].half * dil, dil, precision, m, l, num)
+        if j + 1 < plan.n_octaves:
+            xj = _lowpass_step(plan, xj, j)
+    out = num / l
+    return out, m, l, V_, tiles
+
+
+def _ss_backward(plan: MorletPlan, x, H, V, m, l, out, tiles, gy, nch: int, tau: float, prec: str,
+                 need_x: bool, need_h: bool, tangents=()):
+    """Backward of the spectral softmax -> ``(gx, gH, gV, gtheta)``.
+
+    ``tangents`` are filter tangents dH/dtheta_t (each shaped like ``H``); ``gtheta[t, f]`` is
+    then dL/dtheta_t restricted to the rows of frequency ``f`` (the parameter gradient
+    without dL/dH).  Which kernels run follows :mod:`fdwt.config`:
+
+    * ``fused_input_grad``: dL/dx is scattered by the softmax backward kernel itself (adjoint
+      of its Toeplitz tiles), instead of writing dL/dW to memory for the grad-x kernel;
+    * ``fused_param_grad``: dL/dtheta comes from the same kernel (inner products with the
+      tangent tiles), instead of the grad-h kernel (dL/dH, then contracted with the tangents).
+
+    Both are decided per octave ("auto": by the number of taps).
+
+    dL/dW (``(rows, S_j, N, 2)``, in row chunks) is only materialised for what is not fused,
+    and always for ``need_h`` (an explicit dL/dH).
     """
+    R, N = gy.shape
+    stat, _ = plan.static_tensors(gy.device)
+    v_strides, v_pos = _ss_v_layout(V)
+    nt = len(tangents)
 
-    CHUNK_BYTES = 256 * 2**20
+    def fuse_gx_at(st):
+        mode = config.fused_input_grad
+        return need_x and (mode if isinstance(mode, bool) else 2 * st.half + 1 <= config.fused_input_grad_max_taps)
 
-    @staticmethod
-    def _v_layout(V):
-        if V.dim() == 2:  # (NCH, S)
-            return (0, V.shape[1], 1, 0), False
-        return (V.shape[1] * V.shape[2], 0, V.shape[2], 1), True  # (G, S, N)
+    def fuse_th_at(st):
+        mode = config.fused_param_grad
+        return nt > 0 and (mode if isinstance(mode, bool) else 2 * st.half + 1 > config.fused_param_grad_min_taps)
 
-    @staticmethod
-    def _stage_filters(plan, H, stat):
-        return [H.index_select(0, rows)[:, cols].contiguous() for *_, rows, cols in stat]
+    fuse_any_gx = any(fuse_gx_at(st) for st in plan.stages)
+    gV = torch.zeros_like(V)
+    gH = torch.zeros_like(H) if need_h else None
+    gth = torch.zeros((nt, plan.num_scales), device=gy.device, dtype=V.dtype) if nt else None
+    hs = _ss_stage_filters(plan, H, stat)
+    by_oct = {st.octave: k for k, st in enumerate(plan.stages)}
+    xs = _lowpass_chain(plan, x.to(V.dtype))
+    Cc = plan.channels
 
-    @staticmethod
-    def forward(ctx, x, plan: MorletPlan, H, V, nch: int, tau: float, precision: str):
-        if not plan.complex:
-            raise ValueError("the spectral softmax needs the complex Morlet transform")
-        R, N = x.shape
-        dt = _out_dtype(x.dtype)
-        stat, _ = plan.static_tensors(x.device)
-        V_ = V.to(dt).contiguous()
-        v_strides, v_pos = _SpectralSoftmaxFunction._v_layout(V_)
-        hs = _SpectralSoftmaxFunction._stage_filters(plan, H, stat)
-        tiles = [KS.band_tiles(h.detach(), st_[3], N, 2 ** plan.stages[k].octave, precision)
-                 for k, (h, st_) in enumerate(zip(hs, stat))]
-        m = torch.full((R, N), float("-inf"), device=x.device, dtype=dt)
-        l = torch.zeros((R, N), device=x.device, dtype=dt)
-        num = torch.zeros((R, N), device=x.device, dtype=dt)
-        xj = x
-        by_oct = {st.octave: k for k, st in enumerate(plan.stages)}
-        for j in range(plan.n_octaves):
-            dil, mj = 2 ** j, plan.margins[j]
-            if j in by_oct:
-                k = by_oct[j]
-                _, gidx, _, kf = stat[k][:4]
-                KS.forward_stage(xj, tiles[k], kf, gidx, V_, v_strides, v_pos, nch, 1.0 / tau,
-                                 mj + plan.stages[k].half * dil, dil, precision, m, l, num)
-            if j + 1 < plan.n_octaves:
-                xj = _lowpass_step(plan, xj, j)
-        out = num / l
-        del num
-        ctx.plan, ctx.nch, ctx.tau, ctx.precision = plan, nch, tau, precision
-        ctx.x_dtype, ctx.v_dtype = x.dtype, V.dtype
-        # the low-passed octave signals are recomputed in the backward, not stored
-        ctx.tiles = [(None, bu, nc) for _, bu, nc in tiles]
-        ctx.save_for_backward(x, H, V_, m, l, out, *[t for t, _, _ in tiles])
-        return out
-
-    @staticmethod
-    def backward(ctx, gy):
-        plan: MorletPlan = ctx.plan
-        x, H, V, m, l, out, *tbs = ctx.saved_tensors
-        tiles = [(tb, bu, nc) for tb, (_, bu, nc) in zip(tbs, ctx.tiles)]
-        prec = ctx.precision
-        gy = gy.contiguous().to(V.dtype)
-        R, N = gy.shape
-        stat, _ = plan.static_tensors(gy.device)
-        v_strides, v_pos = _SpectralSoftmaxFunction._v_layout(V)
-        hs = _SpectralSoftmaxFunction._stage_filters(plan, H, stat)
-        need_h = ctx.needs_input_grad[2]
-        gH = torch.zeros_like(H) if need_h else None
-        gV = torch.zeros_like(V)
-        by_oct = {st.octave: k for k, st in enumerate(plan.stages)}
-        xs = _lowpass_chain(plan, x.to(V.dtype))
-
-        g_next = None
-        for j in range(plan.n_octaves - 1, -1, -1):
-            dil, mj = 2 ** j, plan.margins[j]
-            gx = torch.empty((R, N + 2 * mj), device=gy.device, dtype=gy.dtype)
-            filled = False
+    g_next = None
+    for j in range(plan.n_octaves - 1, -1, -1):
+        dil, mj = 2 ** j, plan.margins[j]
+        gx, filled = None, False
+        if need_x:
             if g_next is not None:
+                gx = torch.empty((R, N + 2 * mj), device=gy.device, dtype=gy.dtype)
                 m1 = plan.margins[j + 1]
                 KC.halfband(g_next, plan.halfband_taps(gx.device, gx.dtype), gx,
                             mj - m1 + plan.c_lp * dil, dil, transpose=True)
                 filled = True
-            if j in by_oct:
-                k = by_oct[j]
-                kb, gidx, bs, kf, rows, cols = stat[k]
-                S_j = gidx.numel()
-                off = mj + plan.stages[k].half * dil
+            elif fuse_any_gx:
+                gx = torch.zeros((R, N + 2 * mj), device=gy.device, dtype=gy.dtype)
+                filled = True
+            else:
+                gx = torch.empty((R, N + 2 * mj), device=gy.device, dtype=gy.dtype)
+        if j in by_oct:
+            k = by_oct[j]
+            kb, gidx, bs, kf, rows, cols = stat[k]
+            S_j = gidx.numel()
+            off = mj + plan.stages[k].half * dil
+            fuse_gx = fuse_gx_at(plan.stages[k])
+            fuse_th = fuse_th_at(plan.stages[k])
+            need_gh = need_h or (nt > 0 and not fuse_th)
+            need_gw = (need_x and not fuse_gx) or need_gh
+            tt, tl_k = None, tiles[k]
+            if nt:
+                jt = [t.index_select(0, rows)[:, cols] for t in tangents]
+                if fuse_th:
+                    tt = torch.stack([KS.band_tiles(t.to(V.dtype), kf, N, dil, prec, window=False)[0]
+                                      for t in jt])
+                    if tl_k[3]:  # the tangent tiles need the chunked layout for the filters too
+                        tl_k = KS.band_tiles(H.index_select(0, rows)[:, cols].to(V.dtype), kf, N, dil,
+                                             prec, window=False)
+            if not need_gw:
+                KS.backward_stage(xs[j], tl_k, kf, gidx, V, v_strides, v_pos, nch, 0, 1.0 / tau,
+                                  off, dil, prec, m, l, out, gy, None, gV, gx=gx if fuse_gx else None,
+                                  ttiles=tt, gth=gth)
+            else:
                 h = hs[k]
                 local = torch.arange(S_j, device=gy.device, dtype=torch.int32)
-                chunk = max(1, _SpectralSoftmaxFunction.CHUNK_BYTES // (S_j * N * 2 * gy.element_size()))
+                chunk = max(1, _SpectralSoftmaxFunction.CHUNK_BYTES // (S_j * N * Cc * gy.element_size()))
                 gh_acc = None
                 for r0 in range(0, R, chunk):
                     r1 = min(R, r0 + chunk)
-                    gw = torch.empty((r1 - r0, S_j, N, 2), device=gy.device, dtype=gy.dtype)
-                    KS.backward_stage(xs[j][r0:r1], tiles[k], kf, gidx, V, v_strides, v_pos, ctx.nch,
-                                      r0, 1.0 / ctx.tau, off, dil, prec, m[r0:r1], l[r0:r1],
-                                      out[r0:r1], gy[r0:r1], gw, gV)
-                    KC.backward_x(gw, h, kf, local, gx[r0:r1], off, dil, accumulate=filled,
-                                  precision=prec)
-                    if need_h:
+                    gw = torch.empty((r1 - r0, S_j, N, Cc), device=gy.device, dtype=gy.dtype)
+                    KS.backward_stage(xs[j][r0:r1], tl_k, kf, gidx, V, v_strides, v_pos, nch,
+                                      r0, 1.0 / tau, off, dil, prec, m[r0:r1], l[r0:r1],
+                                      out[r0:r1], gy[r0:r1], gw, gV,
+                                      gx=gx[r0:r1] if fuse_gx else None, ttiles=tt, gth=gth)
+                    if need_x and not fuse_gx:
+                        KC.backward_x(gw, h, kf, local, gx[r0:r1], off, dil, accumulate=filled,
+                                      precision=prec)
+                    if need_gh:
                         gh = KC.backward_h(xs[j][r0:r1], gw, kb, local, off, dil, h.shape[1], bs,
                                            precision=prec)
                         gh_acc = gh if gh_acc is None else gh_acc + gh
                     del gw
                 if need_h:
                     gH[rows, cols] = gh_acc.to(H.dtype)
-                filled = True
-            if not filled:
-                gx.zero_()
-            g_next = gx
-            xs[j] = None  # free each octave signal once its octave is done
-        gx = g_next.to(ctx.x_dtype) if ctx.needs_input_grad[0] else None
+                if nt and not fuse_th:
+                    for t in range(nt):
+                        contrib = (gh_acc * jt[t].to(gh_acc.dtype)).view(S_j, -1).sum(1)
+                        gth[t].index_add_(0, gidx.long(), contrib.to(gth.dtype))
+            filled = True
+        if need_x and not filled:
+            gx.zero_()
+        g_next = gx
+        xs[j] = None  # free each octave signal once its octave is done
+    return g_next, gH, gV, gth
+
+
+class _SpectralSoftmaxFunction(torch.autograd.Function):
+    """out[r, n] = sum_f softmax_f(|W_f x_r|(n) / tau) * V_f[r, n], without materialising W.
+
+    ``V`` is ``(NCH, S)`` (per channel, row r uses ``V[r % NCH]``) or ``(G, S, N)`` (per
+    position, row r uses ``V[r // NCH]``).  The forward keeps a flash-attention style
+    online softmax across octave launches; the backward recomputes one octave at a time.
+    This variant takes the filters ``H`` and returns dL/dH (see
+    :class:`_SpectralSoftmaxParamFunction` for the faster scales / w0 parametrisation).
+    """
+
+    CHUNK_BYTES = 256 * 2**20  # bound on the dL/dW buffer, when it is materialised
+
+    @staticmethod
+    def forward(ctx, x, plan: MorletPlan, H, V, nch: int, tau: float, precision: str):
+        out, m, l, V_, tiles = _ss_forward(x, plan, H, V, nch, tau, precision)
+        ctx.plan, ctx.nch, ctx.tau, ctx.precision = plan, nch, tau, precision
+        ctx.x_dtype, ctx.v_dtype = x.dtype, V.dtype
+        # the low-passed octave signals are recomputed in the backward, not stored
+        ctx.tiles = [(None, *rest) for _, *rest in tiles]
+        ctx.save_for_backward(x, H, V_, m, l, out, *[t[0] for t in tiles])
+        return out
+
+    @staticmethod
+    def backward(ctx, gy):
+        x, H, V, m, l, out, *tbs = ctx.saved_tensors
+        tiles = [(tb, *rest) for tb, (_, *rest) in zip(tbs, ctx.tiles)]
+        gy = gy.contiguous().to(V.dtype)
+        gx, gH, gV, _ = _ss_backward(ctx.plan, x, H, V, m, l, out, tiles, gy, ctx.nch, ctx.tau,
+                                     ctx.precision, ctx.needs_input_grad[0], ctx.needs_input_grad[2])
+        gx = gx.to(ctx.x_dtype) if gx is not None else None
         return gx, None, gH, gV.to(ctx.v_dtype), None, None, None
+
+
+class _SpectralSoftmaxParamFunction(torch.autograd.Function):
+    """Same operator, parametrised by ``log_scales`` and ``w0`` (the filters of
+    :meth:`MorletPlan.filters`) instead of the filter tensor: their gradients are inner
+    products of dL/dW with the convolutions by the filter tangents dH/dlog s and dH/dw0,
+    accumulated inside the softmax backward kernel (no dL/dH, no grad-h pass)."""
+
+    @staticmethod
+    def forward(ctx, x, plan: MorletPlan, log_scales, w0, V, nch: int, tau: float, precision: str):
+        dt = _out_dtype(x.dtype)
+        with torch.no_grad():
+            H = plan.filters(log_scales.detach().to(torch.float64).exp(), _detach(w0), dt)
+        out, m, l, V_, tiles = _ss_forward(x, plan, H, V, nch, tau, precision)
+        ctx.plan, ctx.nch, ctx.tau, ctx.precision = plan, nch, tau, precision
+        ctx.x_dtype, ctx.v_dtype = x.dtype, V.dtype
+        ctx.w0_float = None if isinstance(w0, torch.Tensor) else float(w0)
+        ctx.tiles = [(None, *rest) for _, *rest in tiles]
+        w0_t = w0 if isinstance(w0, torch.Tensor) else log_scales.new_tensor(float(w0))
+        ctx.save_for_backward(x, log_scales, w0_t, H, V_, m, l, out, *[t[0] for t in tiles])
+        return out
+
+    @staticmethod
+    def backward(ctx, gy):
+        x, log_scales, w0, H, V, m, l, out, *tbs = ctx.saved_tensors
+        tiles = [(tb, *rest) for tb, (_, *rest) in zip(tbs, ctx.tiles)]
+        plan: MorletPlan = ctx.plan
+        need_s = ctx.needs_input_grad[2]
+        need_w = ctx.needs_input_grad[3] and ctx.w0_float is None
+        tangents = plan.filter_tangents(log_scales.detach(), w0.detach(), H.dtype, need_s, need_w)
+        gy = gy.contiguous().to(V.dtype)
+        gx, _, gV, gth = _ss_backward(plan, x, H, V, m, l, out, tiles, gy, ctx.nch, ctx.tau,
+                                      ctx.precision, ctx.needs_input_grad[0], False, tangents)
+        gx = gx.to(ctx.x_dtype) if gx is not None else None
+        g_s = gth[0].to(log_scales.dtype) if need_s else None
+        g_w = gth[int(need_s)].sum().to(w0.dtype) if need_w else None
+        return gx, None, g_s, g_w, gV.to(ctx.v_dtype), None, None, None
+
+
+def _detach(w0):
+    return w0.detach() if isinstance(w0, torch.Tensor) else w0
 
 
 def _lowpass_step(plan: MorletPlan, xj, j):
@@ -547,6 +695,22 @@ def spectral_softmax(x: torch.Tensor, plan: MorletPlan, H: torch.Tensor, V: torc
     V = V.to(p.dtype)
     Vb = V[None, :, :, None] if V.dim() == 2 else V[:, None]          # broadcast to p
     return (p * Vb).sum(2).reshape(R, N)
+
+
+def spectral_softmax_params(x: torch.Tensor, plan: MorletPlan, log_scales: torch.Tensor, w0,
+                            V: torch.Tensor, nch: int, tau: float = 1.0) -> torch.Tensor:
+    """:func:`spectral_softmax` with the filters ``plan.filters(exp(log_scales), w0)``,
+    differentiable w.r.t. ``log_scales`` and ``w0`` (a tensor or a float).  On CUDA their
+    gradients are computed inside the fused backward (see :mod:`fdwt.config`)."""
+    if x.is_cuda:
+        prec = KC.resolve_precision(x.dtype)
+        x2 = x.contiguous()
+        if x2.dtype not in (torch.float32, torch.float64):
+            x2 = x2.float()
+        return _SpectralSoftmaxParamFunction.apply(x2, plan, log_scales, w0, V, nch, float(tau), prec)
+    dt = torch.float64 if x.dtype == torch.float64 else torch.float32
+    H = plan.filters(log_scales.to(torch.float64).exp(), w0, dt)
+    return spectral_softmax(x, plan, H, V, nch, tau)
 
 
 # --------------------------------------------------------------------------- torch paths
@@ -709,6 +873,45 @@ class CWT1D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dt = torch.float64 if x.dtype == torch.float64 else torch.float32
         return _apply_plan(x, self.plan, self._filters(x.device, dt))
+
+    def spectral_softmax(self, x: torch.Tensor, V: torch.Tensor, nch: int, tau: float = 1.0) -> torch.Tensor:
+        """``x (R, N)`` -> ``sum_f softmax_f(|W_f x| / tau) V_f`` with this module's filters
+        (see :func:`spectral_softmax`); learnable scales / w0 get their gradients from the
+        fused backward kernel."""
+        if self._learn:
+            return spectral_softmax_params(x, self.plan, self.log_scales, self.w0, V, nch, tau)
+        dt = torch.float64 if x.dtype == torch.float64 else torch.float32
+        return spectral_softmax(x, self.plan, self._filters(x.device, dt), V, nch, tau)
+
+    @torch.no_grad()
+    def replan(self, support_margin: Optional[float] = None, regroup: bool = False) -> "CWT1D":
+        """Rebuild the plan (filter supports, octaves) around the *current* scales.
+
+        The plan is built from the initial scales and fixes every filter's support (and its
+        octave), so learned scales that have shrunk keep being convolved with mostly zero
+        taps, and grown ones get truncated.  ``replan`` resizes the supports to
+        ``truncate * support_margin`` standard deviations of the current scales:
+
+        * ``regroup=False``: every scale stays in its octave (same dilation, same low-pass
+          signal), so the transform is unchanged up to the truncated Gaussian tails (the
+          envelope beyond 4 standard deviations is below 3.4e-4 of its peak);
+        * ``regroup=True``: scales are also re-assigned to octaves from the current scales
+          and wave number, like a fresh plan.  Faster when scales have shrunk below their
+          octave (fewer pyramid levels), but it *changes* the transform where the old
+          octave under-sampled the wavelet.
+
+        Call it after loading trained weights (or periodically while training: with
+        ``support_margin > 1`` scales may grow by that factor before being truncated).
+        """
+        p = self.plan
+        margin = p.support_margin if support_margin is None else float(support_margin)
+        scales = [float(v) for v in self.scales.detach().to(torch.float64).cpu()]
+        w0 = self.w0_value
+        octaves = None if regroup else p.octaves
+        self.plan = MorletPlan(scales, w0 if regroup else p.w0, p.truncate, p.norm, p.complex, p.method,
+                               margin, octaves)
+        self._filter_cache = {}
+        return self
 
     def extra_repr(self) -> str:
         p = self.plan

@@ -155,10 +155,7 @@ class _MorletPatchAttention(nn.Module):
     def _spectral_softmax(self, x: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
         """sum_f softmax_f(|W_f x| / tau) V_f -> (B, H, C, T, D), fused on CUDA."""
         B, H, C, T, D = x.shape
-        dt = torch.float64 if x.dtype == torch.float64 else torch.float32
-        Hf = self.cwt._filters(x.device, dt)
-        out = spectral_softmax(x.reshape(B * H * C, T * D), self.cwt.plan, Hf, V, C,
-                               self.temperature)
+        out = self.cwt.spectral_softmax(x.reshape(B * H * C, T * D), V, C, self.temperature)
         return out.reshape(B, H, C, T, D).to(x.dtype)
 
 

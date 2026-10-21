@@ -44,17 +44,22 @@ from .conv import _acc, _dot
 
 BU, BV, COLS = 32, 16, 64  # tuned on RTX 4080 SUPER (fp32 and bf16 alike)
 NUM_WARPS, NUM_STAGES = 4, 3
+BWD_NUM_WARPS = 4  # fused backward (adjoint + tangents)
+USE_WINDOW, WIN_MAX, WIN_STAGES = True, 64, 2  # one-window tiles for short filters (see band_tiles)
+WIN_BWD_COLS = 32  # narrower tiles for the fused window backward (register pressure)
 
 
 @triton.jit
 def _spectral_softmax_kernel(
     x_ptr, tb_ptr, kf_ptr, gidx_ptr, v_ptr,
     m_ptr, l_ptr, num_ptr,
-    out_ptr, gy_ptr, gw_ptr, gv_ptr,
+    out_ptr, gy_ptr, gw_ptr, gv_ptr, gx_ptr, tt_ptr, gth_ptr,
     R, N_IN, N_OUT, OFF, DIL, S, NCHUNK, NCH, ROW0, INV_TAU, N_PB,
-    SV_G, SV_C, SV_F, SV_N,
+    SV_G, SV_C, SV_F, SV_N, S_TOT, KT,
     ACC: tl.constexpr, GRAD: tl.constexpr, V_PER_POS: tl.constexpr, PRECISION: tl.constexpr,
     BU: tl.constexpr, BV: tl.constexpr, PB: tl.constexpr, BR: tl.constexpr,
+    WRITE_GW: tl.constexpr, FUSE_GX: tl.constexpr, NT: tl.constexpr, V_GROUPED: tl.constexpr,
+    WIN: tl.constexpr,
 ):
     tid = tl.program_id(1)
     p0 = (tid % N_PB) * PB
@@ -69,7 +74,8 @@ def _spectral_softmax_kernel(
     nm = (n < N_OUT) & col_ok[None, :]
     q = OFF // DIL
     rho = OFF - q * DIL
-    x_col = x_ptr + r64 * N_IN + p0 + p + rho                # [COLS]
+    x_off = r64 * N_IN + p0 + p + rho                        # [COLS]
+    x_col = x_ptr + x_off
     xpos0 = p0 + p + rho
     st = r64[None, :] * N_OUT + n
     rg = r + ROW0
@@ -86,16 +92,38 @@ def _spectral_softmax_kernel(
     # columns are all real rows/phases: interior chunks need no bounds checks at all
     full_cols = (tl.program_id(0) * BR + BR <= R) & (p0 + PB <= DIL)
     t_off = u[:, None] * BV + tl.arange(0, BV)[None, :]
+    tile = BU * BV
+    prog = tl.program_id(0) * tl.num_programs(1) + tid      # theta partials: one slot per program
+    if WIN > 0:
+        # short filters: the whole input window of the tile (BU + KT - 1 <= WIN samples per
+        # column) is loaded once and shared by every frequency; tiles are (S, 2, BU, WIN)
+        # with a common alignment, so each frequency is one dot and the adjoint of all the
+        # frequencies accumulates in one register window.
+        w_first = u0 + q - KT + 1
+        vw = w_first + tl.arange(0, WIN)
+        posw = xpos0[None, :] + DIL * vw[:, None]
+        pmw = (posw >= 0) & (posw < N_IN) & col_ok[None, :]
+        Xw = tl.load(x_col[None, :] + DIL * vw[:, None], mask=pmw, other=0.0).to(ACC)
+        tw_off = u[:, None] * WIN + tl.arange(0, WIN)[None, :]
+        if GRAD and FUSE_GX:
+            gXw = tl.zeros([WIN, PB * BR], ACC)
     for s in range(0, S):
         klo = tl.load(kf_ptr + 2 * s)
         khi = tl.load(kf_ptr + 2 * s + 1)
         gi = tl.load(gidx_ptr + s)
-        t_re = tb_ptr + (s * 2 * NCHUNK) * (BU * BV) + t_off
-        t_im = t_re + NCHUNK * (BU * BV)
-        re = tl.zeros([BU, PB * BR], ACC)
-        im = tl.zeros([BU, PB * BR], ACC)
+        if WIN > 0:
+            tw_re = tb_ptr + (s * 2) * (BU * WIN) + tw_off
+            re = _dot(tl.load(tw_re), Xw, ACC, PRECISION)
+            im = _dot(tl.load(tw_re + BU * WIN), Xw, ACC, PRECISION)
+            n_ci = 0
+        else:
+            re = tl.zeros([BU, PB * BR], ACC)
+            im = tl.zeros([BU, PB * BR], ACC)
+            n_ci = (BU + khi - klo - 1 + BV - 1) // BV
+        t_re = tb_ptr + (s * 2 * NCHUNK) * tile + t_off
+        t_im = t_re + NCHUNK * tile
         v_first = u0 + q - khi + 1
-        for ci in range(0, (BU + khi - klo - 1 + BV - 1) // BV):
+        for ci in range(0, n_ci):
             v0 = v_first + ci * BV
             v = v0 + tl.arange(0, BV)
             x_ptrs = x_col[None, :] + DIL * v[:, None]
@@ -107,8 +135,8 @@ def _spectral_softmax_kernel(
                 pos = xpos0[None, :] + DIL * v[:, None]
                 X = tl.load(x_ptrs, mask=(pos >= 0) & (pos < N_IN) & col_ok[None, :],
                             other=0.0).to(ACC)
-            re += _dot(tl.load(t_re + ci * (BU * BV)), X, ACC, PRECISION)
-            im += _dot(tl.load(t_im + ci * (BU * BV)), X, ACC, PRECISION)
+            re += _dot(tl.load(t_re + ci * tile), X, ACC, PRECISION)
+            im += _dot(tl.load(t_im + ci * tile), X, ACC, PRECISION)
 
         mag = tl.sqrt(re * re + im * im)
         a = mag * INV_TAU
@@ -122,14 +150,74 @@ def _spectral_softmax_kernel(
             pf = tl.where(nm, tl.exp(a - m) / l, 0.0)
             gp = gyv * pf
             if V_PER_POS:
-                tl.atomic_add(gv_ptr + v_off, gp, mask=nm)
+                if V_GROUPED:
+                    # every row of this tile shares one V row: reduce over the rows first
+                    # (NCH-fold fewer atomics on the same addresses)
+                    gsum = tl.sum(tl.reshape(gp, [BU, BR, PB]), axis=1)          # [BU, PB]
+                    ph = tl.arange(0, PB)
+                    n2 = p0 + ph[None, :] + DIL * (u0 + u)[:, None]
+                    g0 = (tl.program_id(0) * BR + ROW0) // NCH
+                    m2 = (n2 < N_OUT) & (p0 + ph < DIL)[None, :]
+                    tl.atomic_add(gv_ptr + g0 * SV_G + gi * SV_F + n2 * SV_N, gsum, mask=m2)
+                else:
+                    tl.atomic_add(gv_ptr + v_off, gp, mask=nm)
             else:
                 tl.atomic_add(gv_ptr + v_col + gi * SV_F, tl.sum(gp, axis=0), mask=col_ok)
             inv = tl.where(mag > 0, 1.0 / tl.where(mag > 0, mag, 1.0), 0.0)
             coef = gp * (val - o) * INV_TAU * inv
-            g_off = r64[None, :] * (S * N_OUT * 2) + s * (N_OUT * 2) + n * 2
-            tl.store(gw_ptr + g_off, (coef * re).to(gw_ptr.dtype.element_ty), mask=nm)
-            tl.store(gw_ptr + g_off + 1, (coef * im).to(gw_ptr.dtype.element_ty), mask=nm)
+            g_re = coef * re                                      # dL/dRe W, dL/dIm W
+            g_im = coef * im
+            if WRITE_GW:
+                g_off = r64[None, :] * (S * N_OUT * 2) + s * (N_OUT * 2) + n * 2
+                tl.store(gw_ptr + g_off, g_re.to(gw_ptr.dtype.element_ty), mask=nm)
+                tl.store(gw_ptr + g_off + 1, g_im.to(gw_ptr.dtype.element_ty), mask=nm)
+            if WIN > 0:
+                if FUSE_GX:
+                    gXw += _dot(tl.trans(tl.load(tw_re)), g_re, ACC, PRECISION)
+                    gXw += _dot(tl.trans(tl.load(tw_re + BU * WIN)), g_im, ACC, PRECISION)
+                # dL/dtheta = sum dL/dW * (dT X): the tangent tiles in their natural layout
+                if NT > 0:
+                    d_re = tt_ptr + (s * 2) * (BU * WIN) + tw_off
+                    A = g_re * _dot(tl.load(d_re), Xw, ACC, PRECISION)
+                    A += g_im * _dot(tl.load(d_re + BU * WIN), Xw, ACC, PRECISION)
+                    tl.store(gth_ptr + s * S_TOT + prog, tl.sum(tl.sum(A, axis=1), axis=0))
+                if NT > 1:
+                    d_re2 = d_re + S * 2 * (BU * WIN)
+                    A = g_re * _dot(tl.load(d_re2), Xw, ACC, PRECISION)
+                    A += g_im * _dot(tl.load(d_re2 + BU * WIN), Xw, ACC, PRECISION)
+                    tl.store(gth_ptr + (S + s) * S_TOT + prog, tl.sum(tl.sum(A, axis=1), axis=0))
+            elif FUSE_GX or NT > 0:
+                # adjoint of the banded-Toeplitz product, chunk by chunk:
+                #   dL/dX[v] = T_re^T dL/dRe W + T_im^T dL/dIm W     (scattered into gx)
+                #   dL/dtheta = sum_v X[v] * (dT_re^T dL/dRe W + dT_im^T dL/dIm W)
+                # with dT the tiles of the filter tangents dH/dtheta: the filter gradient is
+                # never formed, and neither is dL/dW.
+                th0 = tl.zeros([BV, PB * BR], ACC)
+                th1 = tl.zeros([BV, PB * BR], ACC)
+                for ci in range(0, n_ci):
+                    v0 = v_first + ci * BV
+                    v = v0 + tl.arange(0, BV)
+                    pos = xpos0[None, :] + DIL * v[:, None]
+                    pm = (pos >= 0) & (pos < N_IN) & col_ok[None, :]
+                    if FUSE_GX:
+                        gX = _dot(tl.trans(tl.load(t_re + ci * tile)), g_re, ACC, PRECISION)
+                        gX += _dot(tl.trans(tl.load(t_im + ci * tile)), g_im, ACC, PRECISION)
+                        tl.atomic_add(gx_ptr + x_off[None, :] + DIL * v[:, None], gX, mask=pm)
+                    if NT > 0:
+                        X = tl.load(x_col[None, :] + DIL * v[:, None], mask=pm, other=0.0).to(ACC)
+                        d_re = tt_ptr + (s * 2 * NCHUNK + ci) * tile + t_off
+                        A = _dot(tl.trans(tl.load(d_re)), g_re, ACC, PRECISION)
+                        A += _dot(tl.trans(tl.load(d_re + NCHUNK * tile)), g_im, ACC, PRECISION)
+                        th0 += A * X
+                        if NT > 1:
+                            d_re2 = d_re + S * 2 * NCHUNK * tile
+                            A = _dot(tl.trans(tl.load(d_re2)), g_re, ACC, PRECISION)
+                            A += _dot(tl.trans(tl.load(d_re2 + NCHUNK * tile)), g_im, ACC, PRECISION)
+                            th1 += A * X
+                if NT > 0:
+                    tl.store(gth_ptr + s * S_TOT + prog, tl.sum(tl.sum(th0, axis=1), axis=0))
+                if NT > 1:
+                    tl.store(gth_ptr + (S + s) * S_TOT + prog, tl.sum(tl.sum(th1, axis=1), axis=0))
         else:
             m_new = tl.maximum(m, a)
             alpha = tl.exp(m - m_new)
@@ -138,24 +226,41 @@ def _spectral_softmax_kernel(
             num = num * alpha + e * val
             m = m_new
 
+    if GRAD and FUSE_GX and WIN > 0:
+        tl.atomic_add(gx_ptr + x_off[None, :] + DIL * vw[:, None], gXw, mask=pmw)
     if not GRAD:
         tl.store(m_ptr + st, m.to(m_ptr.dtype.element_ty), mask=nm)
         tl.store(l_ptr + st, l.to(l_ptr.dtype.element_ty), mask=nm)
         tl.store(num_ptr + st, num.to(num_ptr.dtype.element_ty), mask=nm)
 
 
-def band_tiles(h, kf, n_out: int, dil: int, precision: str):
+def band_tiles(h, kf, n_out: int, dil: int, precision: str, window: bool = True):
     """Dense banded-Toeplitz tiles of one octave's filters, laid out for the kernel.
 
-    ``T[s, part, ci, u, vv] = h[2*s + part, u - ci*BV - vv + khi_s - 1]`` (zero outside the
-    tap range ``[klo_s, khi_s)``).  They do not depend on the output tile, so they are built
-    once per octave instead of being gathered element by element inside the kernel.
-    Returns ``(tiles, bu, n_chunks)``.
+    Short filters (``BU + K - 1 <= WIN_MAX``): ``T[s, part, u, w] = h[2*s + part, u - w + K - 1]``
+    (zero outside ``[0, K)``; the filters are zero outside their own support), one
+    ``(BU, WIN)`` tile per frequency with a common window.  Otherwise chunks of ``BV``
+    columns, ``T[s, part, ci, u, vv] = h[2*s + part, u - ci*BV - vv + khi_s - 1]`` (zero
+    outside the tap range ``[klo_s, khi_s)``).  They do not depend on the output tile, so
+    they are built once per octave instead of being gathered element by element inside the
+    kernel.  Returns ``(tiles, bu, n_chunks, 0)`` (chunked) or ``(tiles, bu, K, win)``.
+    ``window=False`` forces the chunked layout (the fused backward with filter tangents is
+    faster chunked: fewer live registers).
     """
     S, K = kf.shape[0], h.shape[1]
     bu = max(16, min(BU, triton.next_power_of_2(triton.cdiv(n_out, dil))))
-    n_chunks = triton.cdiv(bu + K - 1, BV)
     dev = h.device
+    dt = torch.bfloat16 if precision == "bf16" else h.dtype
+    hh = h.view(S, 2, K)
+    win = max(16, triton.next_power_of_2(bu + K - 1))
+    if window and USE_WINDOW and win <= WIN_MAX:
+        u = torch.arange(bu, device=dev)[:, None]
+        w = torch.arange(win, device=dev)[None, :]
+        kk = u - w + K - 1                                               # (bu, win)
+        valid = (kk >= 0) & (kk < K)
+        tiles = hh[:, :, kk.clamp(0, K - 1)] * valid
+        return tiles.to(dt).contiguous(), bu, K, win
+    n_chunks = triton.cdiv(bu + K - 1, BV)
     ci = torch.arange(n_chunks, device=dev)[:, None, None]
     u = torch.arange(bu, device=dev)[None, :, None]
     vv = torch.arange(BV, device=dev)[None, None, :]
@@ -163,33 +268,47 @@ def band_tiles(h, kf, n_out: int, dil: int, precision: str):
     khi = kf[:, 1].long()[:, None, None, None]
     kk = (u - ci * BV - vv)[None] + khi - 1                         # (S, n_chunks, bu, BV)
     valid = (kk >= klo) & (kk < khi)
-    hh = h.view(S, 2, K)
     tiles = hh[torch.arange(S, device=dev)[:, None, None, None, None],
                torch.arange(2, device=dev)[None, :, None, None, None],
                kk.clamp(0, K - 1)[:, None]] * valid[:, None]
-    dt = torch.bfloat16 if precision == "bf16" else h.dtype
-    return tiles.to(dt).contiguous(), bu, n_chunks
+    return tiles.to(dt).contiguous(), bu, n_chunks, 0
 
 
 def _launch(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, row0, inv_tau, off, dil, precision,
-            m, l, num, out, gy, gw, gv, grad):
+            m, l, num, out, gy, gw, gv, grad, gx=None, ttiles=None, gth=None, nt=0, write_gw=True,
+            num_warps=None):
+    tb, bu, n_chunks, win = tiles
+    K, n_chunks = (n_chunks, 0) if win else (0, n_chunks)
+    fused = grad and (gx is not None or nt > 0)
+    cols = WIN_BWD_COLS if (win and fused) else COLS
     R, n_in = x.shape
     n_out = m.shape[1]
     S = gidx.numel()
     if R == 0 or n_out == 0 or S == 0:
         return
-    tb, bu, n_chunks = tiles
     pb = min(triton.next_power_of_2(dil), 8)
-    br = max(16 // pb, min(COLS // pb, triton.next_power_of_2(R)))
+    br = max(16 // pb, min(cols // pb, triton.next_power_of_2(R)))
     n_pb = triton.cdiv(dil, pb)
     n_ub = triton.cdiv(triton.cdiv(n_out, dil), bu)
     grid = (triton.cdiv(R, br), n_pb * n_ub)
+    # V rows shared by NCH consecutive signal rows: a tile's rows all fall in one V row
+    v_grouped = bool(v_per_pos and grad and nch % br == 0 and row0 % br == 0)
+    fuse_gx = gx is not None
+    n_prog = grid[0] * grid[1]
+    # dL/dtheta: per-program partial sums (same-address atomics from every program serialise)
+    part = torch.empty((nt, S, n_prog), device=x.device, dtype=gth.dtype) if nt else None
     _spectral_softmax_kernel[grid](
         x, tb, kf, gidx, v, m, l, num, out, gy, gw, gv,
+        gx if fuse_gx else x, ttiles if nt else tb, part if nt else m,
         R, n_in, n_out, off, dil, S, n_chunks, nch, row0, inv_tau, n_pb, *v_strides,
+        n_prog, K,
         ACC=_acc(x.dtype), GRAD=grad, V_PER_POS=v_per_pos, PRECISION=precision,
-        BU=bu, BV=BV, PB=pb, BR=br, num_warps=NUM_WARPS, num_stages=NUM_STAGES,
+        BU=bu, BV=BV, PB=pb, BR=br, WRITE_GW=bool(grad and write_gw), FUSE_GX=fuse_gx, NT=nt,
+        V_GROUPED=v_grouped, WIN=win, num_warps=num_warps or NUM_WARPS,
+        num_stages=(1 if x.dtype == torch.float64 else WIN_STAGES) if win else NUM_STAGES,
     )
+    if nt:
+        gth.index_add_(1, gidx.long(), part.sum(-1))
 
 
 def forward_stage(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, inv_tau, off, dil, precision,
@@ -204,7 +323,17 @@ def forward_stage(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, inv_tau, off
 
 
 def backward_stage(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, row0, inv_tau, off, dil,
-                   precision, m, l, out, gy, gw, gv):
-    """Write gw (R, S, N_OUT, 2) = dL/dW for one octave and accumulate gv (= dL/dV)."""
+                   precision, m, l, out, gy, gw, gv, gx=None, ttiles=None, gth=None):
+    """Backward of one octave: accumulates gv (= dL/dV) and, as requested,
+
+    * writes ``gw`` (R, S, N_OUT, 2) = dL/dW (for the grad-x / grad-h kernels), if not None;
+    * accumulates dL/dx into ``gx`` (R, N_IN) directly (fused adjoint, no ``gw``);
+    * accumulates ``gth[t, f] += dL/dtheta_t`` for the filter tangents ``ttiles``
+      (``(T, S, 2, ...)`` tiles of dH/dtheta_t, ``gth`` of shape ``(T, S_TOT)``), from
+      per-program partial sums.
+    """
+    nt = 0 if ttiles is None else ttiles.shape[0]
     _launch(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, row0, inv_tau, off, dil, precision,
-            m, l, m, out, gy, gw, gv, grad=True)
+            m, l, m, out, gy, gw if gw is not None else m, gv, grad=True, gx=gx, ttiles=ttiles,
+            gth=gth, nt=nt, write_gw=gw is not None,
+            num_warps=BWD_NUM_WARPS if (gx is not None or nt) else None)

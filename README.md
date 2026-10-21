@@ -135,6 +135,17 @@ All octaves run in **one autograd node**:
 | grad h | Gradient for learnable scales / `w0`: a (filters × taps) tile reduced over rows and time on tensor cores, in 3×TF32 (split hi/lo operands, fp32 accuracy). |
 | low-pass chain | The same kernels with a single real filter. |
 
+**Spectral softmax backward** (`MorletAttention`, `MorletChannelMixAttention`). The softmax
+backward kernel recomputes one octave at a time. With the scales / `w0` parametrisation
+(`CWT1D.spectral_softmax`, `cwt.spectral_softmax_params`), it also computes their gradients
+itself, as inner products of dL/dW with the convolutions by the filter tangents dH/dlog s
+and dH/dw0, from per-program partial sums. No dL/dH is formed and the grad-h kernel does not
+run. Optionally, it also scatters dL/dx (the adjoint of its Toeplitz tiles, with atomic adds),
+so dL/dW is never written to memory. Each octave chooses between these and the grad-x / grad-h
+kernels according to `fdwt.config.fused_param_grad` and `fused_input_grad` (see `config.py`
+for the measured defaults). Short filters (at most 33 taps for a 32-sample tile) use one
+input window per tile in the forward, shared by every frequency.
+
 **Fused mixer** (`fdwt/kernels/mix.py`). The forward kernel computes each scalogram tile
 in registers and immediately reduces it to `Σ_s a[d,s]·|W_s| + b[d,s]·Re W_s` (an
 epilogue with atomic adds), so only `(B, D, L)` is ever written. The backward pass
@@ -252,7 +263,7 @@ Both wavelet mixers scale linearly with L, while attention scales quadratically.
 
 ## Tests
 
-`pytest` (129 tests, ~30 s on GPU):
+`pytest` (169 tests, ~60 s on GPU):
 
 * **PyWavelets parity:** DWT/IDWT/wavedec/waverec against pywt to 1e-12, for 7 wavelets
   × 5 modes and lengths 1…4097, on GPU and CPU.
@@ -268,6 +279,10 @@ Both wavelet mixers scale linearly with L, while attention scales quadratically.
   deep octaves with large dilations.
 * **Precision and physics:** fp32/fp16/bf16 accuracy; frequency localisation and l1
   amplitude flatness on sinusoids.
+* **Fused backward:** the scales / `w0` path against autograd through the filters with the
+  original kernels, for every `fused_*` setting, both value layouts (including the grouped
+  dL/dV atomics) and replanned plans; the one-window forward against the CPU path; `replan`
+  exactness.
 
 ## Notes and limitations
 
@@ -280,7 +295,13 @@ Both wavelet mixers scale linearly with L, while attention scales quadratically.
   `biorN.M`, …), with `db4` as the default.
 * **Fixed plan with learnable scales.** The octave assignment and the filter supports are
   fixed when the module is built, with a 25% support margin when `learnable=True`. Scales
-  that drift far from their initial values are truncated more aggressively.
+  that drift far from their initial values are truncated more aggressively, and scales that
+  shrink keep paying for their initial supports. `CWT1D.replan()` rebuilds the supports
+  around the current scales and keeps their octaves, so the transform is unchanged up to the
+  truncated Gaussian tails. Call it after loading trained weights, or periodically while
+  training. The plan is not part of the `state_dict`. On REVE's pretrained Morlet layers, the
+  filters shrank from 69–79 to 7–25 taps, and an A100 training step became 1.6× faster.
+  `replan(regroup=True)` also reassigns octaves. That changes the transform.
 * **CWT boundaries.** The CWT zero-pads. For other boundary handling, pad the input
   (`F.pad(..., mode="reflect")`) and crop the output.
 * **`torch.compile`.** The custom autograd Functions launch Triton kernels directly, so
