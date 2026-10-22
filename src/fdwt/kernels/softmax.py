@@ -26,6 +26,11 @@ into a flash-attention style online softmax ``(max, denominator, numerator)`` he
 registers, and carries that state from one octave launch to the next through three
 (R, N) buffers: the scalogram is never written.
 
+Backward, short filters (:func:`backward_stage_sweep`, the default): one program sweeps
+its rows' output tiles in order and applies the adjoint as two banded blocks, carrying the
+part that lands in the next input tile in registers; dL/dx, dL/dV and the filter-tangent
+gradients come out of one pass, without atomics on dL/dx and without dL/dW in memory.
+
 Backward (``GRAD=True``) recomputes one octave's coefficients, rebuilds the softmax
 probabilities from the saved max and denominator, writes ``dL/dW`` for that octave
 (consumed by the grad-x / grad-h kernels) and accumulates ``dL/dV`` with atomics::
@@ -47,6 +52,7 @@ NUM_WARPS, NUM_STAGES = 4, 3
 BWD_NUM_WARPS = 4  # fused backward (adjoint + tangents)
 USE_WINDOW, WIN_MAX, WIN_STAGES = True, 64, 2  # one-window tiles for short filters (see band_tiles)
 WIN_BWD_COLS = 32  # narrower tiles for the fused window backward (register pressure)
+SWEEP_COLS, SWEEP_NUM_WARPS, SWEEP_STAGES = 64, 4, 2  # sweep backward (backward_stage_sweep)
 
 
 @triton.jit
@@ -337,3 +343,197 @@ def backward_stage(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, row0, inv_t
             m, l, m, out, gy, gw if gw is not None else m, gv, grad=True, gx=gx, ttiles=ttiles,
             gth=gth, nt=nt, write_gw=gw is not None,
             num_warps=BWD_NUM_WARPS if (gx is not None or nt) else None)
+
+
+# --------------------------------------------------------------------------- sweep backward
+
+
+@triton.jit
+def _spectral_softmax_bwd_sweep_kernel(
+    x_ptr, tb_ptr, ta_ptr, tt_ptr, kf_ptr, gidx_ptr, v_ptr,
+    m_ptr, l_ptr, out_ptr, gy_ptr, gv_ptr, gx_ptr, part_ptr,
+    R, N_IN, N_OUT, OFF, DIL, S, NCHUNK, NCH, INV_TAU, N_PB, N_UT, KT, P_TOT,
+    SV_G, SV_C, SV_F, SV_N,
+    ACC: tl.constexpr, V_PER_POS: tl.constexpr, PRECISION: tl.constexpr,
+    BU: tl.constexpr, BV: tl.constexpr, PB: tl.constexpr, BR: tl.constexpr,
+    NT: tl.constexpr, V_GROUPED: tl.constexpr, ACCUM: tl.constexpr,
+):
+    pid0 = tl.program_id(0)
+    tid = tl.program_id(1)
+    prog = pid0 * N_PB + tid
+    p0 = tid * PB
+    u = tl.arange(0, BU)
+    pr = tl.arange(0, PB * BR)
+    p = pr % PB
+    r = pid0 * BR + pr // PB
+    col_ok = (r < R) & (p0 + p < DIL)
+    r64 = r.to(tl.int64)
+    q = OFF // DIL
+    rho = OFF - q * DIL
+    x_off = r64 * N_IN + p0 + p + rho
+    x_col = x_ptr + x_off
+    xpos0 = p0 + p + rho
+    v_col = (r // NCH) * SV_G + (r % NCH) * SV_C
+    t_off = u[:, None] * BV + tl.arange(0, BV)[None, :]
+    a_off = u[:, None] * BU + u[None, :]
+    tile = BU * BV
+    full_cols = (pid0 * BR + BR <= R) & (p0 + PB <= DIL)
+
+    carry = tl.zeros([BU, PB * BR], ACC)
+    for t in range(0, N_UT + 1):
+        u0 = t * BU
+        acc = carry
+        carry = tl.zeros([BU, PB * BR], ACC)
+        if t < N_UT:
+            n = p0 + p[None, :] + DIL * (u0 + u)[:, None]
+            nm = (n < N_OUT) & col_ok[None, :]
+            st = r64[None, :] * N_OUT + n
+            m = tl.load(m_ptr + st, mask=nm, other=0.0).to(ACC)
+            l = tl.load(l_ptr + st, mask=nm, other=1.0).to(ACC)
+            o = tl.load(out_ptr + st, mask=nm, other=0.0).to(ACC)
+            gyv = tl.load(gy_ptr + st, mask=nm, other=0.0).to(ACC)
+            for s in range(0, S):
+                klo = tl.load(kf_ptr + 2 * s)
+                khi = tl.load(kf_ptr + 2 * s + 1)
+                gi = tl.load(gidx_ptr + s)
+                t_re = tb_ptr + (s * 2 * NCHUNK) * tile + t_off
+                t_im = t_re + NCHUNK * tile
+                re = tl.zeros([BU, PB * BR], ACC)
+                im = tl.zeros([BU, PB * BR], ACC)
+                v_first = u0 + q - khi + 1
+                n_ci = (BU + khi - klo - 1 + BV - 1) // BV
+                for ci in range(0, n_ci):
+                    v0 = v_first + ci * BV
+                    v = v0 + tl.arange(0, BV)
+                    x_ptrs = x_col[None, :] + DIL * v[:, None]
+                    lo = p0 + rho + DIL * v0
+                    hi = p0 + PB - 1 + rho + DIL * (v0 + BV - 1)
+                    if full_cols & (lo >= 0) & (hi < N_IN):
+                        X = tl.load(x_ptrs).to(ACC)
+                    else:
+                        pos = xpos0[None, :] + DIL * v[:, None]
+                        X = tl.load(x_ptrs, mask=(pos >= 0) & (pos < N_IN) & col_ok[None, :], other=0.0).to(ACC)
+                    re += _dot(tl.load(t_re + ci * tile), X, ACC, PRECISION)
+                    im += _dot(tl.load(t_im + ci * tile), X, ACC, PRECISION)
+                mag = tl.sqrt(re * re + im * im)
+                a = mag * INV_TAU
+                if V_PER_POS:
+                    v_off = v_col[None, :] + gi * SV_F + n * SV_N
+                    val = tl.load(v_ptr + v_off, mask=nm, other=0.0).to(ACC)
+                else:
+                    val = tl.load(v_ptr + v_col + gi * SV_F, mask=col_ok, other=0.0).to(ACC)[None, :]
+                pf = tl.where(nm, tl.exp(a - m) / l, 0.0)
+                gp = gyv * pf
+                if V_PER_POS:
+                    if V_GROUPED:
+                        gsum = tl.sum(tl.reshape(gp, [BU, BR, PB]), axis=1)
+                        ph = tl.arange(0, PB)
+                        n2 = p0 + ph[None, :] + DIL * (u0 + u)[:, None]
+                        g0 = (pid0 * BR) // NCH
+                        m2 = (n2 < N_OUT) & (p0 + ph < DIL)[None, :]
+                        tl.atomic_add(gv_ptr + g0 * SV_G + gi * SV_F + n2 * SV_N, gsum, mask=m2)
+                    else:
+                        tl.atomic_add(gv_ptr + v_off, gp, mask=nm)
+                else:
+                    tl.atomic_add(gv_ptr + v_col + gi * SV_F, tl.sum(gp, axis=0), mask=col_ok)
+                inv = tl.where(mag > 0, 1.0 / tl.where(mag > 0, mag, 1.0), 0.0)
+                coef = gp * (val - o) * INV_TAU * inv
+                g_re = coef * re
+                g_im = coef * im
+                # adjoint: A -> input tile I_t, B -> head of I_{t+1}
+                a_re = ta_ptr + (s * 4) * (BU * BU) + a_off
+                acc += _dot(tl.load(a_re), g_re, ACC, PRECISION)
+                acc += _dot(tl.load(a_re + BU * BU), g_im, ACC, PRECISION)
+                carry += _dot(tl.load(a_re + 2 * BU * BU), g_re, ACC, PRECISION)
+                carry += _dot(tl.load(a_re + 3 * BU * BU), g_im, ACC, PRECISION)
+                if NT > 0:
+                    th0 = tl.zeros([BV, PB * BR], ACC)
+                    th1 = tl.zeros([BV, PB * BR], ACC)
+                    for ci in range(0, n_ci):
+                        v0 = v_first + ci * BV
+                        v = v0 + tl.arange(0, BV)
+                        pos = xpos0[None, :] + DIL * v[:, None]
+                        pm = (pos >= 0) & (pos < N_IN) & col_ok[None, :]
+                        X = tl.load(x_col[None, :] + DIL * v[:, None], mask=pm, other=0.0).to(ACC)
+                        d_re = tt_ptr + (s * 2 * NCHUNK + ci) * tile + t_off
+                        A = _dot(tl.trans(tl.load(d_re)), g_re, ACC, PRECISION)
+                        A += _dot(tl.trans(tl.load(d_re + NCHUNK * tile)), g_im, ACC, PRECISION)
+                        th0 += A * X
+                        if NT > 1:
+                            d2 = d_re + S * 2 * NCHUNK * tile
+                            A = _dot(tl.trans(tl.load(d2)), g_re, ACC, PRECISION)
+                            A += _dot(tl.trans(tl.load(d2 + NCHUNK * tile)), g_im, ACC, PRECISION)
+                            th1 += A * X
+                    slot = (prog * N_UT + t) * S + s
+                    tl.store(part_ptr + slot, tl.sum(tl.sum(th0, axis=1), axis=0))
+                    if NT > 1:
+                        tl.store(part_ptr + P_TOT * N_UT * S + slot, tl.sum(tl.sum(th1, axis=1), axis=0))
+        # input tile I_t starts at v = u0 + q - KT + 1 (input lattice of the phase)
+        vI = u0 + q - KT + 1 + u
+        posI = xpos0[None, :] + DIL * vI[:, None]
+        pmI = (posI >= 0) & (posI < N_IN) & col_ok[None, :]
+        g_ptrs = gx_ptr + x_off[None, :] + DIL * vI[:, None]
+        if ACCUM:
+            acc += tl.load(g_ptrs, mask=pmI, other=0.0).to(ACC)
+        tl.store(g_ptrs, acc.to(gx_ptr.dtype.element_ty), mask=pmI)
+
+
+def adjoint_tiles(h, bu, dtype):
+    """(S*2, K) stage filters -> (S, 4, bu, bu): [A_re, A_im, B_re, B_im] with
+    A[v', u'] = h[u' - v' + K - 1],  B[v', u'] = h[u' - v' - bu + K - 1]  (zero outside [0, K))."""
+    S2, K = h.shape
+    S = S2 // 2
+    hh = h.view(S, 2, K)
+    dev = h.device
+    vp = torch.arange(bu, device=dev)[:, None]
+    up = torch.arange(bu, device=dev)[None, :]
+    out = []
+    for shift in (K - 1, K - 1 - bu):
+        kk = up - vp + shift
+        valid = (kk >= 0) & (kk < K)
+        out.append(hh[:, :, kk.clamp(0, K - 1)] * valid)                  # (S, 2, bu, bu)
+    return torch.cat(out, 1).to(dtype).contiguous()                         # (S, 4, bu, bu)
+
+
+def backward_stage_sweep(x, tiles, h, kf, gidx, v, v_strides, v_per_pos, nch, inv_tau, off, dil, precision,
+                         m, l, out, gy, gv, gx, accumulate, ttiles=None, gth=None):
+    """Atomic-free fused backward of one octave (short filters, ``K <= BU + 1``).
+
+    A program owns ``BR`` rows x ``PB`` phases and walks their output tiles in order: it
+    recomputes W and dL/dW in registers, accumulates dL/dV and the filter-tangent partials
+    (``gth[t, f] += dL/dtheta_t``, as :func:`backward_stage`), and applies the adjoint of the
+    filters as two banded ``BU x BU`` blocks, ``A`` into the input tile aligned with the output
+    tile and ``B`` into the head of the next one; ``B @ dL/dW`` is carried to the next step, so
+    every dL/dx sample is written once with a plain store (``accumulate``: added to ``gx``).
+    No dL/dW buffer, no grad-x / grad-h pass.  ``tiles`` must be chunked (``band_tiles(...,
+    window=False)``), ``ttiles`` likewise.
+    """
+    tb, bu, n_chunks, win = tiles
+    if win:
+        raise ValueError("the sweep backward takes chunked tiles (band_tiles(..., window=False))")
+    R, n_in = x.shape
+    n_out = m.shape[1]
+    K = h.shape[1]
+    if K > bu + 1:
+        raise ValueError(f"the sweep backward needs K <= {bu + 1} taps, got {K}")
+    S = gidx.numel()
+    if R == 0 or n_out == 0 or S == 0:
+        return
+    pb = min(triton.next_power_of_2(dil), 8)
+    br = max(16 // pb, min(SWEEP_COLS // pb, triton.next_power_of_2(R)))
+    n_pb = triton.cdiv(dil, pb)
+    n_ut = triton.cdiv(triton.cdiv(n_out, dil), bu)
+    grid = (triton.cdiv(R, br), n_pb)
+    P = grid[0] * grid[1]
+    ta = adjoint_tiles(h, bu, tb.dtype)
+    nt = 0 if ttiles is None else ttiles.shape[0]
+    part = torch.empty((max(nt, 1), P * n_ut * S), device=x.device, dtype=gv.dtype)
+    _spectral_softmax_bwd_sweep_kernel[grid](
+        x, tb, ta, ttiles if nt else tb, kf, gidx, v, m, l, out, gy, gv, gx, part,
+        R, n_in, n_out, off, dil, S, n_chunks, nch, inv_tau, n_pb, n_ut, K, P, *v_strides,
+        ACC=_acc(x.dtype), V_PER_POS=v_per_pos, PRECISION=precision, BU=bu, BV=BV, PB=pb, BR=br,
+        NT=nt, V_GROUPED=bool(v_per_pos and nch % br == 0), ACCUM=bool(accumulate),
+        num_warps=SWEEP_NUM_WARPS, num_stages=SWEEP_STAGES,
+    )
+    if nt:
+        gth.index_add_(1, gidx.long(), part.view(nt, P * n_ut, S).sum(1))

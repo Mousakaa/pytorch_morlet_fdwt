@@ -38,3 +38,11 @@ fused_input_grad = False
 fused_input_grad_max_taps: int = 33
 fused_param_grad = "auto"
 fused_param_grad_min_taps: int = 33
+
+# ``sweep_backward``: octaves with short filters (at most ``sweep_backward_max_taps`` taps, the
+# case after ``CWT1D.replan``) run the one-pass, atomic-free sweep backward: dL/dx, dL/dV and the
+# scales / w0 gradients without dL/dW in memory (1.7-3.3x faster per octave than the grad-x /
+# grad-h path on an RTX 4080 SUPER, REVE EEG shape).  Takes precedence over the two flags above
+# for those octaves; not used for an explicit dL/dH (``spectral_softmax`` with ``H`` requiring grad).
+sweep_backward = "auto"
+sweep_backward_max_taps: int = 33

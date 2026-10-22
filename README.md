@@ -143,7 +143,14 @@ and dH/dw0, from per-program partial sums. No dL/dH is formed and the grad-h ker
 run. Optionally, it also scatters dL/dx (the adjoint of its Toeplitz tiles, with atomic adds),
 so dL/dW is never written to memory. Each octave chooses between these and the grad-x / grad-h
 kernels according to `fdwt.config.fused_param_grad` and `fused_input_grad` (see `config.py`
-for the measured defaults). Short filters (at most 33 taps for a 32-sample tile) use one
+for the measured defaults). Octaves with short filters (at most 33 taps, as after
+`CWT1D.replan()`) use the **sweep backward** by default (`fdwt.config.sweep_backward`). Each
+program walks its rows' output tiles in order. It recomputes W and dL/dW in registers. It
+applies the filters' adjoint as two banded 32×32 blocks: one for the aligned input tile, one
+for the head of the next input tile, which is carried to the next step in registers. So dL/dx
+is written once with plain stores, and dL/dW is never materialised. On REVE's pretrained
+layers (EEG shape, RTX 4080 SUPER), this backward is 1.7–3.3× faster per octave than the
+grad-x / grad-h path, and the whole layer is about 1.55× faster. Short filters (at most 33 taps for a 32-sample tile) use one
 input window per tile in the forward, shared by every frequency.
 
 **Fused mixer** (`fdwt/kernels/mix.py`). The forward kernel computes each scalogram tile
@@ -263,7 +270,7 @@ Both wavelet mixers scale linearly with L, while attention scales quadratically.
 
 ## Tests
 
-`pytest` (169 tests, ~60 s on GPU):
+`pytest` (191 tests, ~2.5 min on GPU):
 
 * **PyWavelets parity:** DWT/IDWT/wavedec/waverec against pywt to 1e-12, for 7 wavelets
   × 5 modes and lengths 1…4097, on GPU and CPU.
@@ -281,7 +288,8 @@ Both wavelet mixers scale linearly with L, while attention scales quadratically.
   amplitude flatness on sinusoids.
 * **Fused backward:** the scales / `w0` path against autograd through the filters with the
   original kernels, for every `fused_*` setting, both value layouts (including the grouped
-  dL/dV atomics) and replanned plans; the one-window forward against the CPU path; `replan`
+  dL/dV atomics) and replanned plans, with the sweep backward on and off; the sweep on short
+  signals and partial row tiles; the one-window forward against the CPU path; `replan`
   exactness.
 
 ## Notes and limitations

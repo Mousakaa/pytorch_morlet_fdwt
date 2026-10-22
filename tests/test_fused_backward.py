@@ -12,9 +12,10 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 @pytest.fixture
 def config_restore():
-    saved = (fdwt.config.fused_input_grad, fdwt.config.fused_param_grad, KS.USE_WINDOW)
+    saved = (fdwt.config.fused_input_grad, fdwt.config.fused_param_grad, fdwt.config.sweep_backward, KS.USE_WINDOW)
     yield
-    fdwt.config.fused_input_grad, fdwt.config.fused_param_grad, KS.USE_WINDOW = saved
+    (fdwt.config.fused_input_grad, fdwt.config.fused_param_grad, fdwt.config.sweep_backward,
+     KS.USE_WINDOW) = saved
 
 
 def _module(shrink=0.0, w0=6.0):
@@ -33,8 +34,8 @@ def _grads(fn, x, V, ls, w0, gy):
 @cuda
 @pytest.mark.parametrize("per_position,nch", [(False, 8), (True, 8), (True, 64)])
 @pytest.mark.parametrize("fused_x,fused_p", list(itertools.product([False, True, "auto"], [False, True])))
-@pytest.mark.parametrize("replan", [False, True])
-def test_param_path_matches_filter_autograd(per_position, nch, fused_x, fused_p, replan, config_restore):
+@pytest.mark.parametrize("replan,sweep", [(False, "auto"), (True, False), (True, "auto")])
+def test_param_path_matches_filter_autograd(per_position, nch, fused_x, fused_p, replan, sweep, config_restore):
     # the scales / w0 parametrisation (in-kernel filter gradients, fused dL/dx) against autograd
     # through the filters with the original kernels; nch=64 takes the grouped dL/dV atomics
     torch.manual_seed(0)
@@ -50,8 +51,10 @@ def test_param_path_matches_filter_autograd(per_position, nch, fused_x, fused_p,
     gy = torch.randn(R, N, device="cuda", dtype=dt)
 
     fdwt.config.fused_input_grad, fdwt.config.fused_param_grad = fused_x, fused_p
+    fdwt.config.sweep_backward = sweep
     got = _grads(lambda x, V, ls, w0: spectral_softmax_params(x, m.plan, ls, w0, V, nch, 0.1), x, V, ls, w0, gy)
     fdwt.config.fused_input_grad, fdwt.config.fused_param_grad = False, False
+    fdwt.config.sweep_backward = False
     KS.USE_WINDOW = False
     ref = _grads(lambda x, V, ls, w0: spectral_softmax(x, m.plan, m.plan.filters(ls.exp(), w0, dt), V, nch, 0.1),
                  x, V, ls, w0, gy)
@@ -117,3 +120,28 @@ def test_plan_octaves_argument():
     assert p.octaves == [0, 0] and p.n_octaves == 1
     with pytest.raises(ValueError):
         fdwt.MorletPlan([2.0, 40.0], octaves=[0])
+
+
+@cuda
+@pytest.mark.parametrize("R,N,nch,per_position", [(3, 40, 3, False), (5, 17, 5, True), (130, 1000, 65, True),
+                                                  (64, 300, 64, True)])
+def test_sweep_backward_shapes(R, N, nch, per_position, config_restore):
+    # short signals (16-sample tiles, where the sweep needs K <= 17 and falls back otherwise),
+    # row counts that do not fill a tile, V rows shared by nch rows; fp64, against the grad-x /
+    # grad-h path
+    torch.manual_seed(1)
+    m = _module(shrink=2.0, w0=0.7).double()
+    m.replan()
+    dt = torch.float64
+    x = torch.randn(R, N, device="cuda", dtype=dt, requires_grad=True)
+    V = torch.randn((R // nch, 16, N) if per_position else (nch, 16), device="cuda", dtype=dt, requires_grad=True)
+    ls = m.log_scales.detach().clone().requires_grad_()
+    w0 = torch.tensor(m.w0_value, device="cuda", dtype=dt, requires_grad=True)
+    gy = torch.randn(R, N, device="cuda", dtype=dt)
+    fn = lambda x, V, ls, w0: spectral_softmax_params(x, m.plan, ls, w0, V, nch, 0.3)
+    fdwt.config.sweep_backward = "auto"
+    got = _grads(fn, x, V, ls, w0, gy)
+    fdwt.config.sweep_backward = False
+    ref = _grads(fn, x, V, ls, w0, gy)
+    for a, b in zip(got, ref):
+        torch.testing.assert_close(a, b, atol=1e-10 * b.abs().max().item(), rtol=0)
