@@ -511,6 +511,7 @@ def _ss_backward(plan: MorletPlan, x, H, V, m, l, out, tiles, gy, nch: int, tau:
                                           else 2 * st.half + 1 <= config.sweep_backward_max_taps)
 
     fuse_any_gx = any(fuse_gx_at(st) or sweep_at(st) for st in plan.stages)
+    ml = (m + torch.log(l)) if any(sweep_at(st) for st in plan.stages) else None  # shared by the sweep launches
     gV = torch.zeros_like(V)
     gH = torch.zeros_like(H) if need_h else None
     gth = torch.zeros((nt, plan.num_scales), device=gy.device, dtype=V.dtype) if nt else None
@@ -545,15 +546,13 @@ def _ss_backward(plan: MorletPlan, x, H, V, m, l, out, tiles, gy, nch: int, tau:
             need_gh = need_h or (nt > 0 and not fuse_th)
             need_gw = (need_x and not fuse_gx) or need_gh
             tt, tl_k = None, tiles[k]
-            if sweep_at(plan.stages[k]) and 2 * plan.stages[k].half + 1 <= tl_k[1] + 1:
-                if tl_k[3]:
-                    tl_k = KS.band_tiles(hs[k].to(V.dtype), kf, N, dil, prec, window=False)
-                if nt:
-                    tt = torch.stack([KS.band_tiles(t.index_select(0, rows)[:, cols].to(V.dtype), kf, N, dil,
-                                                    prec, window=False)[0] for t in tangents])
-                KS.backward_stage_sweep(xs[j], tl_k, hs[k].to(V.dtype), kf, gidx, V, v_strides, v_pos, nch,
+            if sweep_at(plan.stages[k]) and KS.sweep_supported(2 * plan.stages[k].half + 1, N, dil):
+                h_k = hs[k].to(V.dtype)
+                jt = [t.index_select(0, rows)[:, cols].to(V.dtype) for t in tangents]
+                tl_k, kf_k, tt = KS.sweep_tiles(h_k, kf, N, dil, prec, jt)
+                KS.backward_stage_sweep(xs[j], tl_k, h_k, kf_k, gidx, V, v_strides, v_pos, nch,
                                         1.0 / tau, off, dil, prec, m, l, out, gy, gV, gx, filled,
-                                        ttiles=tt, gth=gth)
+                                        ttiles=tt, gth=gth, ml=ml)
                 g_next = gx
                 xs[j] = None
                 continue

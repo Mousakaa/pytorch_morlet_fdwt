@@ -123,16 +123,43 @@ def test_plan_octaves_argument():
 
 
 @cuda
+@pytest.mark.parametrize("shrink", [2.0, 1.5, 1.0])  # 11-13 taps (one carried tile), 17-19 (both), 27-31 (two)
 @pytest.mark.parametrize("R,N,nch,per_position", [(3, 40, 3, False), (5, 17, 5, True), (130, 1000, 65, True),
-                                                  (64, 300, 64, True)])
-def test_sweep_backward_shapes(R, N, nch, per_position, config_restore):
-    # short signals (16-sample tiles, where the sweep needs K <= 17 and falls back otherwise),
+                                                  (64, 300, 64, True), (96, 300, 32, True)])
+def test_sweep_backward_shapes(R, N, nch, per_position, shrink, config_restore):
+    # short signals, 16-row tiles with one or two carried input tiles and 2-3 shared input chunks,
     # row counts that do not fill a tile, V rows shared by nch rows; fp64, against the grad-x /
     # grad-h path
     torch.manual_seed(1)
-    m = _module(shrink=2.0, w0=0.7).double()
+    m = _module(shrink=shrink, w0=0.7).double()
     m.replan()
     dt = torch.float64
+    x = torch.randn(R, N, device="cuda", dtype=dt, requires_grad=True)
+    V = torch.randn((R // nch, 16, N) if per_position else (nch, 16), device="cuda", dtype=dt, requires_grad=True)
+    ls = m.log_scales.detach().clone().requires_grad_()
+    w0 = torch.tensor(m.w0_value, device="cuda", dtype=dt, requires_grad=True)
+    gy = torch.randn(R, N, device="cuda", dtype=dt)
+    fn = lambda x, V, ls, w0: spectral_softmax_params(x, m.plan, ls, w0, V, nch, 0.3)
+    fdwt.config.sweep_backward = "auto"
+    got = _grads(fn, x, V, ls, w0, gy)
+    fdwt.config.sweep_backward = False
+    ref = _grads(fn, x, V, ls, w0, gy)
+    for a, b in zip(got, ref):
+        torch.testing.assert_close(a, b, atol=1e-10 * b.abs().max().item(), rtol=0)
+
+
+@cuda
+@pytest.mark.parametrize("shrink", [2.0, 1.0])  # one / two carried input tiles across segment boundaries
+@pytest.mark.parametrize("per_position", [False, True])
+def test_sweep_backward_segments(shrink, per_position, config_restore, monkeypatch):
+    # rows split into many one-tile segments: every boundary tile is shared by two programs
+    monkeypatch.setattr(KS, "SWEEP_MIN_PROGRAMS_PER_SM", 10**6)
+    monkeypatch.setattr(KS, "SWEEP_MIN_SEG_TILES", 1)
+    torch.manual_seed(2)
+    m = _module(shrink=shrink, w0=0.7).double()
+    m.replan()
+    dt = torch.float64
+    R, N, nch = 64, 400, 32
     x = torch.randn(R, N, device="cuda", dtype=dt, requires_grad=True)
     V = torch.randn((R // nch, 16, N) if per_position else (nch, 16), device="cuda", dtype=dt, requires_grad=True)
     ls = m.log_scales.detach().clone().requires_grad_()
