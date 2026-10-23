@@ -172,3 +172,35 @@ def test_sweep_backward_segments(shrink, per_position, config_restore, monkeypat
     ref = _grads(fn, x, V, ls, w0, gy)
     for a, b in zip(got, ref):
         torch.testing.assert_close(a, b, atol=1e-10 * b.abs().max().item(), rtol=0)
+
+
+@cuda
+@pytest.mark.parametrize("case", ["zero_tail", "tiny_rows", "tiny_tail"])
+def test_sweep_backward_fp32_degenerate_rows(case, config_restore):
+    # fp32 takes the fast-math sweep (rsqrt, exp2): zero-padded or tiny inputs give subnormal
+    # |W|^2, which rsqrt flushes to 0; the gradients must stay finite and match the grad-x /
+    # grad-h path
+    torch.manual_seed(3)
+    m = _module(shrink=1.0, w0=0.7)
+    m.replan()
+    R, N, nch = 96, 400, 32
+    x = 0.3 * torch.randn(R, N, device="cuda")
+    if case == "zero_tail":
+        x[::3, N // 2:] = 0
+    elif case == "tiny_rows":
+        x[::3] *= 1e-20
+    else:
+        x[::3, N // 2:] *= 1e-22
+    x.requires_grad_()
+    V = torch.randn(R // nch, 16, N, device="cuda", requires_grad=True)
+    ls = m.log_scales.detach().clone().requires_grad_()
+    w0 = torch.tensor(m.w0_value, device="cuda", requires_grad=True)
+    gy = torch.randn(R, N, device="cuda")
+    fn = lambda x, V, ls, w0: spectral_softmax_params(x, m.plan, ls, w0, V, nch, 0.1)
+    fdwt.config.sweep_backward = "auto"
+    got = _grads(fn, x, V, ls, w0, gy)
+    fdwt.config.sweep_backward = False
+    ref = _grads(fn, x, V, ls, w0, gy)
+    for a, b in zip(got, ref):
+        assert torch.isfinite(a).all()
+        torch.testing.assert_close(a, b, atol=1e-4 * b.abs().max().item(), rtol=0)

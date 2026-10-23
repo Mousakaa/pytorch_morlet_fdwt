@@ -558,8 +558,10 @@ def _spectral_softmax_bwd_sweep_kernel(
                     re += _dot(tl.load(t_re + ci * tile), X, ACC, PRECISION)
                     im += _dot(tl.load(t_im + ci * tile), X, ACC, PRECISION)
                 sq = re * re + im * im
-                if FAST:  # one MUFU.RSQ gives 1/|W| and |W|
-                    inv = tl.where(sq > 0, tl.rsqrt(tl.where(sq > 0, sq, 1.0)), 0.0)
+                if FAST:  # one MUFU.RSQ gives 1/|W| and |W|; it flushes subnormal sq to 0 (-> inf),
+                    # so |W|^2 below the smallest normal float counts as 0 (|W| < 1.1e-19)
+                    nz = sq >= 1.1754943508222875e-38
+                    inv = tl.where(nz, tl.rsqrt(tl.where(nz, sq, 1.0)), 0.0)
                     mag = sq * inv
                 else:
                     mag = tl.sqrt(sq)
