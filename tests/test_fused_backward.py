@@ -204,3 +204,19 @@ def test_sweep_backward_fp32_degenerate_rows(case, config_restore):
     for a, b in zip(got, ref):
         assert torch.isfinite(a).all()
         torch.testing.assert_close(a, b, atol=1e-4 * b.abs().max().item(), rtol=0)
+
+
+@pytest.mark.parametrize("norm,complex_", [("l2", True), ("l1", True), ("l2", False)])
+def test_filter_tangents_match_jvp(norm, complex_):
+    # closed-form dH/dlog s and dH/dw0 against forward-mode autodiff of the filters
+    torch.manual_seed(4)
+    m = fdwt.CWT1D(freqs=torch.logspace(0, 1.2, 16).tolist(), fs=64, learnable=True, learnable_w0=True,
+                   norm=norm, complex=complex_).double()
+    p = m.plan
+    ls = m.log_scales.detach() + 0.1 * torch.randn(16, dtype=torch.float64)
+    w = torch.tensor(4.7, dtype=torch.float64)
+    fn = lambda a, b: p.filters(a.exp(), b, torch.float64)
+    ref = [torch.func.jvp(fn, (ls, w), (torch.ones_like(ls), torch.zeros_like(w)))[1],
+           torch.func.jvp(fn, (ls, w), (torch.zeros_like(ls), torch.ones_like(w)))[1]]
+    for a, b in zip(p.filter_tangents(ls, w, torch.float64), ref):
+        torch.testing.assert_close(a, b, atol=1e-14 * b.abs().max().item(), rtol=0)

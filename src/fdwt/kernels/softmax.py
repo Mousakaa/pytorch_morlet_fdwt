@@ -88,12 +88,17 @@ def uniform_kf(kf, K: int):
     return out
 
 
+def sweep_uniform(K: int, n_out: int, dil: int) -> bool:
+    """Whether :func:`sweep_tiles` gives every frequency the octave's full tap range."""
+    return SWEEP_UNI and sweep_tile_rows(K, n_out, dil) + K - 1 <= SWEEP_UNI_MAXCH * BV
+
+
 def sweep_tiles(h, kf, n_out: int, dil: int, precision: str, tangents=()):
     """Tiles for :func:`backward_stage_sweep`: ``(tiles, kf, tangent tiles or None)``, with the
     common-alignment tap ranges when an output tile's window fits ``SWEEP_UNI_MAXCH`` chunks."""
     K = h.shape[1]
     bu = sweep_tile_rows(K, n_out, dil)
-    if SWEEP_UNI and bu + K - 1 <= SWEEP_UNI_MAXCH * BV:
+    if sweep_uniform(K, n_out, dil):
         kf = uniform_kf(kf, K)
     tiles = band_tiles(h, kf, n_out, dil, precision, window=False, bu=bu)
     tt = (torch.stack([band_tiles(t, kf, n_out, dil, precision, window=False, bu=bu)[0] for t in tangents])
@@ -669,7 +674,8 @@ def adjoint_tiles(h, bu, dtype, ncarry: int = 1):
 
 
 def backward_stage_sweep(x, tiles, h, kf, gidx, v, v_strides, v_per_pos, nch, inv_tau, off, dil, precision,
-                         m, l, out, gy, gv, gx, accumulate, ttiles=None, gth=None, ml=None):
+                         m, l, out, gy, gv, gx, accumulate, ttiles=None, gth=None, ml=None, uniform=None,
+                         ta=None, taps=None):
     """Atomic-free fused backward of one octave (short filters, ``K <= BU + 1``).
 
     A program owns ``BR`` rows x ``PB`` phases and walks their output tiles in order: it
@@ -680,7 +686,9 @@ def backward_stage_sweep(x, tiles, h, kf, gidx, v, v_strides, v_per_pos, nch, in
     every dL/dx sample is written once with a plain store (``accumulate``: added to ``gx``).
     No dL/dW buffer, no grad-x / grad-h pass.  ``ml``: ``m + log(l)``, precomputed once for all
     the octaves (otherwise formed per tile).  ``tiles`` must be chunked (``band_tiles(...,
-    window=False)``), ``ttiles`` likewise.
+    window=False)``), ``ttiles`` likewise.  ``ta`` / ``taps``: the :func:`adjoint_tiles` and
+    the number of taps, prebuilt (then ``h`` is not needed); ``uniform``: whether ``kf`` is
+    the common tap range (:func:`sweep_uniform`; otherwise read back from the device).
     """
     tb, bu, n_chunks, win = tiles
     if win:
@@ -689,7 +697,7 @@ def backward_stage_sweep(x, tiles, h, kf, gidx, v, v_strides, v_per_pos, nch, in
         raise ValueError("the sweep backward indexes V with 32-bit offsets")
     R, n_in = x.shape
     n_out = m.shape[1]
-    K = h.shape[1]
+    K = h.shape[1] if taps is None else taps
     if K > 2 * bu + 1:
         raise ValueError(f"the sweep backward needs K <= {2 * bu + 1} taps, got {K}")
     ncarry = 1 if K <= bu + 1 else 2
@@ -709,10 +717,12 @@ def backward_stage_sweep(x, tiles, h, kf, gidx, v, v_strides, v_per_pos, nch, in
     t_seg = triton.cdiv(n_ut, n_seg)
     n_seg = triton.cdiv(n_ut, t_seg)
     grid = (triton.cdiv(R, br), n_pb, n_seg)
-    ta = adjoint_tiles(h, bu, tb.dtype, ncarry)
+    if ta is None:
+        ta = adjoint_tiles(h, bu, tb.dtype, ncarry)
     nt = 0 if ttiles is None else ttiles.shape[0]
-    ncu = n_chunks if (SWEEP_UNI and 2 <= n_chunks <= 3 and bool((kf[:, 0] == 0).all())
-                       and bool((kf[:, 1] == K).all())) else 0
+    if uniform is None:  # reads kf back from the device: pass it to keep the stream asynchronous
+        uniform = bool((kf[:, 0] == 0).all()) and bool((kf[:, 1] == K).all())
+    ncu = n_chunks if (SWEEP_UNI and 2 <= n_chunks <= 3 and uniform) else 0
     part = torch.empty((max(nt, 1), P * n_ut * S), device=x.device, dtype=gv.dtype)
     ml_pre = bool(SWEEP_ML_PRE and ml is not None)
     _spectral_softmax_bwd_sweep_kernel[grid](

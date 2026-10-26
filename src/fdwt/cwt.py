@@ -42,6 +42,7 @@ from torch import nn
 
 from . import config, reference
 from .kernels import conv as KC
+from .kernels import filters as KF
 from .kernels import mix as KM
 from .kernels import softmax as KS
 
@@ -194,6 +195,24 @@ class MorletPlan:
             self._static_cache[key] = self.lowpass[self.c_lp:].to(device=device, dtype=dtype).contiguous()
         return self._static_cache[key]
 
+    def _grid(self, dev: torch.device):
+        """``(dil, sup, k)``: per-scale dilation and half-support (``(S, 1)``) and the tap
+        offsets ``(1, 2*center+1)``, fp64, cached per device."""
+        key = ("grid", dev)
+        if key not in self._static_cache:  # host -> device copies would sync the stream
+            f64 = torch.float64
+            self._static_cache[key] = (
+                torch.tensor(self._dil, dtype=f64, device=dev)[:, None],
+                torch.tensor(self._sup, dtype=f64, device=dev)[:, None],
+                torch.arange(-self.center, self.center + 1, device=dev, dtype=f64)[None, :],
+            )
+        return self._static_cache[key]
+
+    def _pack(self, re: torch.Tensor, im: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        if not self.complex:
+            return re.to(dtype)
+        return torch.stack([re, im], 1).reshape(-1, re.shape[1]).to(dtype)
+
     def filters(self, scales: torch.Tensor, w0, dtype: torch.dtype) -> torch.Tensor:
         """All sampled Morlet filters as one ``(S*C, 2*center+1)`` tensor (row ``i*C + c``).
 
@@ -203,14 +222,7 @@ class MorletPlan:
         dev = scales.device
         f64 = torch.float64
         s = scales.to(f64)[:, None]
-        key = ("grid", dev)
-        if key not in self._static_cache:  # host -> device copies would sync the stream
-            self._static_cache[key] = (
-                torch.tensor(self._dil, dtype=f64, device=dev)[:, None],
-                torch.tensor(self._sup, dtype=f64, device=dev)[:, None],
-                torch.arange(-self.center, self.center + 1, device=dev, dtype=f64)[None, :],
-            )
-        dil, sup, k = self._static_cache[key]
+        dil, sup, k = self._grid(dev)
         t = k * dil / s
         env = torch.exp(-0.5 * t * t) * (k.abs() <= sup)
         # a dilated sum approximates the Riemann sum with spacing `dil`
@@ -218,26 +230,39 @@ class MorletPlan:
         w0_ = torch.as_tensor(w0, dtype=f64, device=dev)
         w0t = w0_ * t
         re = (torch.cos(w0t) - torch.exp(-0.5 * w0_ * w0_)) * env * amp
-        if not self.complex:
-            return re.to(dtype)
-        im = torch.sin(w0t) * env * amp
-        return torch.stack([re, im], 1).reshape(-1, k.shape[1]).to(dtype)
-
+        im = torch.sin(w0t) * env * amp if self.complex else None
+        return self._pack(re, im, dtype)
 
     def filter_tangents(self, log_scales: torch.Tensor, w0, dtype: torch.dtype,
                         wrt_scales: bool = True, wrt_w0: bool = True) -> List[torch.Tensor]:
         """Derivatives of :meth:`filters` (``exp(log_scales)``, ``w0``), each shaped like it:
-        dH/dlog s (row ``i*C + c`` w.r.t. its own scale ``i``) and dH/dw0."""
+        dH/dlog s (row ``i*C + c`` w.r.t. its own scale ``i``) and dH/dw0.
+
+        In closed form, with ``t = k dil / s``, ``E = amp * envelope`` and ``c0 = exp(-w0^2/2)``
+        (``amp ~ s^-p``, p = 1/2 for the l2 norm, 1 for l1)::
+
+            dRe/dlog s = (w0 t sin + (cos - c0) (t^2 - p)) E    dIm/dlog s = (sin (t^2 - p) - w0 t cos) E
+            dRe/dw0    = (w0 c0 - t sin) E                       dIm/dw0    = t cos E
+        """
         f64 = torch.float64
         ls = log_scales.detach().to(f64)
-        w = torch.as_tensor(w0, dtype=f64, device=ls.device).detach()
-        fn = lambda a, b: self.filters(a.exp(), b, f64)
+        dev = ls.device
+        dil, sup, k = self._grid(dev)
+        s = ls.exp()[:, None]
+        l2 = self.norm == "l2"
+        t = k * dil / s
+        e = torch.exp(-0.5 * t * t) * (k.abs() <= sup) * (_PI_M14 * dil / (s.sqrt() if l2 else s))
+        w = torch.as_tensor(w0, dtype=f64, device=dev).detach()
+        wt = w * t
+        cs, sn = torch.cos(wt), torch.sin(wt)
+        c0 = torch.exp(-0.5 * w * w)
         out = []
         if wrt_scales:
-            out.append(torch.func.jvp(fn, (ls, w), (torch.ones_like(ls), torch.zeros_like(w)))[1])
+            q = t * t - (0.5 if l2 else 1.0)
+            out.append(self._pack((wt * sn + (cs - c0) * q) * e, (sn * q - wt * cs) * e, dtype))
         if wrt_w0:
-            out.append(torch.func.jvp(fn, (ls, w), (torch.zeros_like(ls), torch.ones_like(w)))[1])
-        return [t.to(dtype) for t in out]
+            out.append(self._pack((w * c0 - t * sn) * e, t * cs * e, dtype))
+        return out
 
 
 # --------------------------------------------------------------------------- GPU path
@@ -441,8 +466,17 @@ def _ss_stage_filters(plan, H, stat):
     return [H.index_select(0, rows)[:, cols].contiguous() for *_, rows, cols in stat]
 
 
-def _ss_forward(x, plan: MorletPlan, H, V, nch: int, tau: float, precision: str):
-    """Forward of the spectral softmax: ``(out, m, l, V_, tiles)``."""
+def _ss_fwd_tiles(plan: MorletPlan, H, N: int, precision: str):
+    """The forward's band tiles of every stage (see :func:`kernels.softmax.band_tiles`)."""
+    stat, _ = plan.static_tensors(H.device)
+    hs = _ss_stage_filters(plan, H, stat)
+    return [KS.band_tiles(h.detach(), st_[3], N, 2 ** plan.stages[k].octave, precision)
+            for k, (h, st_) in enumerate(zip(hs, stat))]
+
+
+def _ss_forward(x, plan: MorletPlan, H, V, nch: int, tau: float, precision: str, tiles=None):
+    """Forward of the spectral softmax: ``(out, m, l, V_, tiles)`` (``tiles``: prebuilt band
+    tiles, otherwise built from ``H``)."""
     if not plan.complex:
         raise ValueError("the spectral softmax needs the complex Morlet transform")
     R, N = x.shape
@@ -450,9 +484,8 @@ def _ss_forward(x, plan: MorletPlan, H, V, nch: int, tau: float, precision: str)
     stat, _ = plan.static_tensors(x.device)
     V_ = V.to(dt).contiguous()
     v_strides, v_pos = _ss_v_layout(V_)
-    hs = _ss_stage_filters(plan, H, stat)
-    tiles = [KS.band_tiles(h.detach(), st_[3], N, 2 ** plan.stages[k].octave, precision)
-             for k, (h, st_) in enumerate(zip(hs, stat))]
+    if tiles is None:
+        tiles = _ss_fwd_tiles(plan, H, N, precision)
     m = torch.full((R, N), float("-inf"), device=x.device, dtype=dt)
     l = torch.zeros((R, N), device=x.device, dtype=dt)
     num = torch.zeros((R, N), device=x.device, dtype=dt)
@@ -471,13 +504,68 @@ def _ss_forward(x, plan: MorletPlan, H, V, nch: int, tau: float, precision: str)
     return out, m, l, V_, tiles
 
 
+def _ss_bwd_modes(st: _Stage, need_x: bool, need_h: bool, nt: int):
+    """``(sweep, fuse_gx, fuse_th)`` of one stage's backward, from :mod:`fdwt.config`."""
+    K = 2 * st.half + 1
+    mode = config.fused_input_grad
+    fuse_gx = need_x and (mode if isinstance(mode, bool) else K <= config.fused_input_grad_max_taps)
+    mode = config.fused_param_grad
+    fuse_th = nt > 0 and (mode if isinstance(mode, bool) else K > config.fused_param_grad_min_taps)
+    mode = config.sweep_backward  # atomic-free one-pass backward (needs dL/dx, no explicit dL/dH)
+    sweep = need_x and not need_h and (mode if isinstance(mode, bool) else K <= config.sweep_backward_max_taps)
+    return sweep, fuse_gx, fuse_th
+
+
+def _ss_bwd_inputs(plan: MorletPlan, H, tangents, tiles, N: int, prec: str, vdt, need_x: bool, need_h: bool):
+    """Per stage, the filter operands of the backward: a dict with ``sweep`` (one-pass kernel),
+    ``tl`` (band tiles replacing the forward's, or None), ``kf``, ``tt`` (tangent tiles),
+    ``ta`` / ``K`` (sweep adjoint blocks, taps), ``h`` (stage filters, for the dL/dW path)
+    and ``jt`` (stage tangents, for the grad-h contraction).  Only layout operations on ``H``
+    and ``tangents``, so :func:`_param_operands` can run it once on index codes."""
+    stat, _ = plan.static_tensors(H.device)
+    nt = len(tangents)
+    hs = _ss_stage_filters(plan, H, stat)
+    out = []
+    for k, st in enumerate(plan.stages):
+        kb, gidx, bs, kf, rows, cols = stat[k]
+        dil = 2 ** st.octave
+        sweep, fuse_gx, fuse_th = _ss_bwd_modes(st, need_x, need_h, nt)
+        need_gh = need_h or (nt > 0 and not fuse_th)
+        need_gw = (need_x and not fuse_gx) or need_gh
+        d = {"sweep": False, "tl": None, "kf": kf, "tt": None, "ta": None, "K": 0, "h": None, "jt": []}
+        if sweep and KS.sweep_supported(2 * st.half + 1, N, dil):
+            h_k = hs[k].to(vdt)
+            jt = [t.index_select(0, rows)[:, cols].to(vdt) for t in tangents]
+            tl_k, kf_k, tt = KS.sweep_tiles(h_k, kf, N, dil, prec, jt)
+            K, bu = h_k.shape[1], tl_k[1]
+            d.update(sweep=True, tl=tl_k, kf=kf_k, tt=tt, K=K,
+                     ta=KS.adjoint_tiles(h_k, bu, tl_k[0].dtype, 1 if K <= bu + 1 else 2))
+        else:
+            if nt:
+                jt = [t.index_select(0, rows)[:, cols] for t in tangents]
+                if fuse_th:
+                    d["tt"] = torch.stack([KS.band_tiles(t.to(vdt), kf, N, dil, prec, window=False)[0]
+                                           for t in jt])
+                    if tiles[k][3]:  # the tangent tiles need the chunked layout for the filters too
+                        d["tl"] = KS.band_tiles(H.index_select(0, rows)[:, cols].to(vdt), kf, N, dil,
+                                                prec, window=False)
+                else:
+                    d["jt"] = jt
+            if need_gw:
+                d["h"] = hs[k]
+        out.append(d)
+    return out
+
+
 def _ss_backward(plan: MorletPlan, x, H, V, m, l, out, tiles, gy, nch: int, tau: float, prec: str,
-                 need_x: bool, need_h: bool, tangents=()):
+                 need_x: bool, need_h: bool, tangents=(), pre=None, nt=None):
     """Backward of the spectral softmax -> ``(gx, gH, gV, gtheta)``.
 
     ``tangents`` are filter tangents dH/dtheta_t (each shaped like ``H``); ``gtheta[t, f]`` is
     then dL/dtheta_t restricted to the rows of frequency ``f`` (the parameter gradient
-    without dL/dH).  Which kernels run follows :mod:`fdwt.config`:
+    without dL/dH).  ``pre``: the operands of :func:`_ss_bwd_inputs`, prebuilt (with ``nt``
+    tangents; ``H`` and ``tangents`` are then not used).  Which kernels run follows
+    :mod:`fdwt.config`:
 
     * ``fused_input_grad``: dL/dx is scattered by the softmax backward kernel itself (adjoint
       of its Toeplitz tiles), instead of writing dL/dW to memory for the grad-x kernel;
@@ -495,27 +583,16 @@ def _ss_backward(plan: MorletPlan, x, H, V, m, l, out, tiles, gy, nch: int, tau:
     R, N = gy.shape
     stat, _ = plan.static_tensors(gy.device)
     v_strides, v_pos = _ss_v_layout(V)
-    nt = len(tangents)
+    if pre is None:
+        nt = len(tangents)
+        pre = _ss_bwd_inputs(plan, H, tangents, tiles, N, prec, V.dtype, need_x, need_h)
+    modes = [_ss_bwd_modes(st, need_x, need_h, nt) for st in plan.stages]
 
-    def fuse_gx_at(st):
-        mode = config.fused_input_grad
-        return need_x and (mode if isinstance(mode, bool) else 2 * st.half + 1 <= config.fused_input_grad_max_taps)
-
-    def fuse_th_at(st):
-        mode = config.fused_param_grad
-        return nt > 0 and (mode if isinstance(mode, bool) else 2 * st.half + 1 > config.fused_param_grad_min_taps)
-
-    def sweep_at(st):  # atomic-free one-pass backward (needs dL/dx, no explicit dL/dH)
-        mode = config.sweep_backward
-        return need_x and not need_h and (mode if isinstance(mode, bool)
-                                          else 2 * st.half + 1 <= config.sweep_backward_max_taps)
-
-    fuse_any_gx = any(fuse_gx_at(st) or sweep_at(st) for st in plan.stages)
-    ml = (m + torch.log(l)) if any(sweep_at(st) for st in plan.stages) else None  # shared by the sweep launches
+    fuse_any_gx = any(sw or fx for sw, fx, _ in modes)
+    ml = (m + torch.log(l)) if any(d["sweep"] for d in pre) else None  # shared by the sweep launches
     gV = torch.zeros_like(V)
     gH = torch.zeros_like(H) if need_h else None
     gth = torch.zeros((nt, plan.num_scales), device=gy.device, dtype=V.dtype) if nt else None
-    hs = _ss_stage_filters(plan, H, stat)
     by_oct = {st.octave: k for k, st in enumerate(plan.stages)}
     xs = _lowpass_chain(plan, x.to(V.dtype))
     Cc = plan.channels
@@ -539,37 +616,28 @@ def _ss_backward(plan: MorletPlan, x, H, V, m, l, out, tiles, gy, nch: int, tau:
         if j in by_oct:
             k = by_oct[j]
             kb, gidx, bs, kf, rows, cols = stat[k]
+            d = pre[k]
             S_j = gidx.numel()
             off = mj + plan.stages[k].half * dil
-            fuse_gx = fuse_gx_at(plan.stages[k])
-            fuse_th = fuse_th_at(plan.stages[k])
+            _, fuse_gx, fuse_th = modes[k]
             need_gh = need_h or (nt > 0 and not fuse_th)
             need_gw = (need_x and not fuse_gx) or need_gh
-            tt, tl_k = None, tiles[k]
-            if sweep_at(plan.stages[k]) and KS.sweep_supported(2 * plan.stages[k].half + 1, N, dil):
-                h_k = hs[k].to(V.dtype)
-                jt = [t.index_select(0, rows)[:, cols].to(V.dtype) for t in tangents]
-                tl_k, kf_k, tt = KS.sweep_tiles(h_k, kf, N, dil, prec, jt)
-                KS.backward_stage_sweep(xs[j], tl_k, h_k, kf_k, gidx, V, v_strides, v_pos, nch,
+            if d["sweep"]:
+                KS.backward_stage_sweep(xs[j], d["tl"], None, d["kf"], gidx, V, v_strides, v_pos, nch,
                                         1.0 / tau, off, dil, prec, m, l, out, gy, gV, gx, filled,
-                                        ttiles=tt, gth=gth, ml=ml)
+                                        ttiles=d["tt"], gth=gth, ml=ml,
+                                        uniform=KS.sweep_uniform(d["K"], N, dil), ta=d["ta"], taps=d["K"])
                 g_next = gx
                 xs[j] = None
                 continue
-            if nt:
-                jt = [t.index_select(0, rows)[:, cols] for t in tangents]
-                if fuse_th:
-                    tt = torch.stack([KS.band_tiles(t.to(V.dtype), kf, N, dil, prec, window=False)[0]
-                                      for t in jt])
-                    if tl_k[3]:  # the tangent tiles need the chunked layout for the filters too
-                        tl_k = KS.band_tiles(H.index_select(0, rows)[:, cols].to(V.dtype), kf, N, dil,
-                                             prec, window=False)
+            tt = d["tt"]
+            tl_k = tiles[k] if d["tl"] is None else d["tl"]
             if not need_gw:
                 KS.backward_stage(xs[j], tl_k, kf, gidx, V, v_strides, v_pos, nch, 0, 1.0 / tau,
                                   off, dil, prec, m, l, out, gy, None, gV, gx=gx if fuse_gx else None,
                                   ttiles=tt, gth=gth)
             else:
-                h = hs[k]
+                h = d["h"]
                 local = torch.arange(S_j, device=gy.device, dtype=torch.int32)
                 chunk = max(1, _SpectralSoftmaxFunction.CHUNK_BYTES // (S_j * N * Cc * gy.element_size()))
                 gh_acc = None
@@ -592,7 +660,7 @@ def _ss_backward(plan: MorletPlan, x, H, V, m, l, out, tiles, gy, nch: int, tau:
                     gH[rows, cols] = gh_acc.to(H.dtype)
                 if nt and not fuse_th:
                     for t in range(nt):
-                        contrib = (gh_acc * jt[t].to(gh_acc.dtype)).view(S_j, -1).sum(1)
+                        contrib = (gh_acc * d["jt"][t].to(gh_acc.dtype)).view(S_j, -1).sum(1)
                         gth[t].index_add_(0, gidx.long(), contrib.to(gth.dtype))
             filled = True
         if need_x and not filled:
@@ -600,6 +668,83 @@ def _ss_backward(plan: MorletPlan, x, H, V, m, l, out, tiles, gy, nch: int, tau:
         g_next = gx
         xs[j] = None  # free each octave signal once its octave is done
     return g_next, gH, gV, gth
+
+
+class _Slot:
+    __slots__ = ("i",)
+
+    def __init__(self, i: int):
+        self.i = i
+
+
+def _encode(obj, slots: list):
+    """Replace the floating tensors of a nested dict / list / tuple by slots (kept in ``slots``)."""
+    if isinstance(obj, torch.Tensor) and obj.is_floating_point():
+        slots.append(obj)
+        return _Slot(len(slots) - 1)
+    if isinstance(obj, dict):
+        return {k: _encode(v, slots) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_encode(v, slots) for v in obj)
+    return obj
+
+
+def _decode(obj, views: list):
+    if isinstance(obj, _Slot):
+        return views[obj.i]
+    if isinstance(obj, dict):
+        return {k: _decode(v, views) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_decode(v, views) for v in obj)
+    return obj
+
+
+def _layout_knobs() -> tuple:
+    """The settings that shape the tile layouts (part of the code-map cache key)."""
+    return (config.fused_input_grad, config.fused_input_grad_max_taps, config.fused_param_grad,
+            config.fused_param_grad_min_taps, config.sweep_backward, config.sweep_backward_max_taps,
+            KS.BU, KS.BV, KS.USE_WINDOW, KS.WIN_MAX, KS.SWEEP_BU, KS.SWEEP_SMALL_BU,
+            KS.SWEEP_SMALL_MAX_CARRY, KS.SWEEP_UNI, KS.SWEEP_UNI_MAXCH)
+
+
+def _param_operands(plan: MorletPlan, log_scales, w0, dtype, key: tuple, build):
+    """``build(codes)`` with every filter / tangent sample evaluated at the current
+    ``log_scales`` and ``w0``, in one :func:`kernels.filters.morlet_eval` launch.
+
+    ``build`` lays out the plan's filters (``codes[0]``), dH/dlog s (``codes[1]``) and
+    dH/dw0 (``codes[2]``) with index selects, gathers and masks only; it runs once per
+    ``key`` on fp64 index codes, and its floating outputs become one int32 code map.
+    """
+    dev = log_scales.device
+    ck = ("operands", dev) + key
+    if ck not in plan._static_cache:
+        W = 2 * plan.center + 1
+        n = 3 * plan.num_scales * plan.channels * W
+        codes = torch.arange(1, n + 1, device=dev, dtype=torch.float64).view(3, -1, W)
+        slots: list = []
+        template = _encode(build(codes), slots)
+        maps = (torch.cat([t.reshape(-1) for t in slots]).to(torch.int32) if slots
+                else torch.zeros(0, device=dev, dtype=torch.int32))
+        sizes = [t.numel() for t in slots]
+        offs = [sum(sizes[:i]) for i in range(len(sizes))]
+        plan._static_cache[ck] = (template, maps, [(o, s_, t.shape) for o, s_, t in zip(offs, sizes, slots)])
+    template, maps, spans = plan._static_cache[ck]
+    buf = torch.empty(maps.numel(), device=dev, dtype=dtype)
+    dil, sup, _ = plan._grid(dev)
+    KF.morlet_eval(maps, buf, log_scales, w0, dil, sup, plan.channels, 2 * plan.center + 1, plan.center,
+                   plan.norm == "l2")
+    return _decode(template, [buf[o:o + s_].view(sh) for o, s_, sh in spans])
+
+
+def _bf16_tiles(pre):
+    """Cast the tile operands of :func:`_ss_bwd_inputs` to the bf16 dot operands."""
+    for d in pre:
+        if d["tl"] is not None:
+            d["tl"] = (d["tl"][0].to(torch.bfloat16), *d["tl"][1:])
+        for key in ("tt", "ta"):
+            if d[key] is not None:
+                d[key] = d[key].to(torch.bfloat16)
+    return pre
 
 
 class _SpectralSoftmaxFunction(torch.autograd.Function):
@@ -639,33 +784,49 @@ class _SpectralSoftmaxParamFunction(torch.autograd.Function):
     """Same operator, parametrised by ``log_scales`` and ``w0`` (the filters of
     :meth:`MorletPlan.filters`) instead of the filter tensor: their gradients are inner
     products of dL/dW with the convolutions by the filter tangents dH/dlog s and dH/dw0,
-    accumulated inside the softmax backward kernel (no dL/dH, no grad-h pass)."""
+    accumulated inside the softmax backward kernel (no dL/dH, no grad-h pass).  Filters,
+    tangents and all their tiles come from one :func:`kernels.filters.morlet_eval` launch
+    per pass (see :func:`_param_operands`)."""
 
     @staticmethod
     def forward(ctx, x, plan: MorletPlan, log_scales, w0, V, nch: int, tau: float, precision: str):
         dt = _out_dtype(x.dtype)
-        with torch.no_grad():
-            H = plan.filters(log_scales.detach().to(torch.float64).exp(), _detach(w0), dt)
-        out, m, l, V_, tiles = _ss_forward(x, plan, H, V, nch, tau, precision)
+        N = x.shape[1]
+        tiles = _param_operands(plan, log_scales, _detach(w0), dt, ("fwd", N) + _layout_knobs(),
+                                lambda codes: _ss_fwd_tiles(plan, codes[0], N, "ieee"))
+        if precision == "bf16":
+            tiles = [(t.to(torch.bfloat16), *rest) for t, *rest in tiles]
+        out, m, l, V_, tiles = _ss_forward(x, plan, None, V, nch, tau, precision, tiles=tiles)
         ctx.plan, ctx.nch, ctx.tau, ctx.precision = plan, nch, tau, precision
         ctx.x_dtype, ctx.v_dtype = x.dtype, V.dtype
         ctx.w0_float = None if isinstance(w0, torch.Tensor) else float(w0)
         ctx.tiles = [(None, *rest) for _, *rest in tiles]
         w0_t = w0 if isinstance(w0, torch.Tensor) else log_scales.new_tensor(float(w0))
-        ctx.save_for_backward(x, log_scales, w0_t, H, V_, m, l, out, *[t[0] for t in tiles])
+        ctx.save_for_backward(x, log_scales, w0_t, V_, m, l, out, *[t[0] for t in tiles])
         return out
 
     @staticmethod
     def backward(ctx, gy):
-        x, log_scales, w0, H, V, m, l, out, *tbs = ctx.saved_tensors
+        x, log_scales, w0, V, m, l, out, *tbs = ctx.saved_tensors
         tiles = [(tb, *rest) for tb, (_, *rest) in zip(tbs, ctx.tiles)]
         plan: MorletPlan = ctx.plan
+        need_x = ctx.needs_input_grad[0]
         need_s = ctx.needs_input_grad[2]
         need_w = ctx.needs_input_grad[3] and ctx.w0_float is None
-        tangents = plan.filter_tangents(log_scales.detach(), w0.detach(), H.dtype, need_s, need_w)
+        N = gy.shape[1]
+        meta = ctx.tiles
+
+        def build(codes):
+            tangents = [codes[1]] * need_s + [codes[2]] * need_w
+            return _ss_bwd_inputs(plan, codes[0], tangents, meta, N, "ieee", torch.float64, need_x, False)
+
+        pre = _param_operands(plan, log_scales, w0.detach(), V.dtype,
+                              ("bwd", N, need_x, need_s, need_w) + _layout_knobs(), build)
+        if ctx.precision == "bf16":
+            pre = _bf16_tiles(pre)
         gy = gy.contiguous().to(V.dtype)
-        gx, _, gV, gth = _ss_backward(plan, x, H, V, m, l, out, tiles, gy, ctx.nch, ctx.tau,
-                                      ctx.precision, ctx.needs_input_grad[0], False, tangents)
+        gx, _, gV, gth = _ss_backward(plan, x, None, V, m, l, out, tiles, gy, ctx.nch, ctx.tau,
+                                      ctx.precision, need_x, False, pre=pre, nt=int(need_s) + int(need_w))
         gx = gx.to(ctx.x_dtype) if gx is not None else None
         g_s = gth[0].to(log_scales.dtype) if need_s else None
         g_w = gth[int(need_s)].sum().to(w0.dtype) if need_w else None

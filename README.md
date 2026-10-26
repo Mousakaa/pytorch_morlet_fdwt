@@ -156,6 +156,13 @@ backward of a replanned layer is about 3.8× faster than the grad-x / grad-h pat
 whole layer is about 2× faster. Short filters (at most 33 taps for a 32-sample tile) use one
 input window per tile in the forward, shared by every frequency.
 
+With the scales / `w0` parametrisation, the filters, their tangents (in closed form) and every
+tile layout the kernels read come from one launch per pass (`fdwt/kernels/filters.py`). The
+layouts depend only on the plan, so they are built once as an index map and cached; each call
+evaluates the Morlet expressions at the mapped positions. A layer's forward + backward then
+costs about 0.8 ms of host time and about 45 launches, instead of about 6.6 ms and 700 launches
+(RTX 4080 SUPER host), so training no longer waits on Python when the GPU is fast.
+
 **Fused mixer** (`fdwt/kernels/mix.py`). The forward kernel computes each scalogram tile
 in registers and immediately reduces it to `Σ_s a[d,s]·|W_s| + b[d,s]·Re W_s` (an
 epilogue with atomic adds), so only `(B, D, L)` is ever written. The backward pass
@@ -273,7 +280,7 @@ Both wavelet mixers scale linearly with L, while attention scales quadratically.
 
 ## Tests
 
-`pytest` (206 tests, ~4 min on GPU):
+`pytest` (212 tests, ~4 min on GPU):
 
 * **PyWavelets parity:** DWT/IDWT/wavedec/waverec against pywt to 1e-12, for 7 wavelets
   × 5 modes and lengths 1…4097, on GPU and CPU.
