@@ -112,19 +112,24 @@ def _spectral_softmax_kernel(
     m_ptr, l_ptr, num_ptr,
     out_ptr, gy_ptr, gw_ptr, gv_ptr, gx_ptr, tt_ptr, gth_ptr,
     R, N_IN, N_OUT, OFF, DIL, S, NCHUNK, NCH, ROW0, INV_TAU, N_PB,
-    SV_G, SV_C, SV_F, SV_N, S_TOT, KT,
+    SV_G, SV_C, SV_F, SV_N, SV_H, S_TOT, KT, N_RB, S_ST, NV,
     ACC: tl.constexpr, GRAD: tl.constexpr, V_PER_POS: tl.constexpr, PRECISION: tl.constexpr,
     BU: tl.constexpr, BV: tl.constexpr, PB: tl.constexpr, BR: tl.constexpr,
     WRITE_GW: tl.constexpr, FUSE_GX: tl.constexpr, NT: tl.constexpr, V_GROUPED: tl.constexpr,
-    WIN: tl.constexpr,
+    WIN: tl.constexpr, HV: tl.constexpr,
 ):
+    # grid axis 0 = (filter bank, row block): bank hb convolves the shared signal rows with its
+    # own S filters (stage scales hb * S ...) and keeps its own softmax state (rows hb * R ...)
+    hb = tl.program_id(0) // N_RB
+    rb = tl.program_id(0) - hb * N_RB
+    sb = hb * S
     tid = tl.program_id(1)
     p0 = (tid % N_PB) * PB
     u0 = (tid // N_PB) * BU
     u = tl.arange(0, BU)
     pr = tl.arange(0, PB * BR)
     p = pr % PB
-    r = tl.program_id(0) * BR + pr // PB
+    r = rb * BR + pr // PB
     col_ok = (r < R) & (p0 + p < DIL)
     r64 = r.to(tl.int64)
     n = p0 + p[None, :] + DIL * (u0 + u)[:, None]           # [BU, COLS] output positions
@@ -134,23 +139,34 @@ def _spectral_softmax_kernel(
     x_off = r64 * N_IN + p0 + p + rho                        # [COLS]
     x_col = x_ptr + x_off
     xpos0 = p0 + p + rho
-    st = r64[None, :] * N_OUT + n
+    st = (r64 + hb * R)[None, :] * N_OUT + n
     rg = r + ROW0
     v_col = (rg // NCH) * SV_G + (rg % NCH) * SV_C            # [COLS]
+    if HV > 1:  # value heads: one softmax, HV numerators / outputs (head stride NV)
+        hv = tl.arange(0, HV)
+        st3 = hv[:, None, None].to(tl.int64) * NV + st[None, :, :]
+        nm3 = nm[None, :, :] & (hv < HV)[:, None, None]
 
     m = tl.load(m_ptr + st, mask=nm, other=0.0).to(ACC)
     l = tl.load(l_ptr + st, mask=nm, other=1.0).to(ACC)
     if GRAD:
+        # HV > 1: out_ptr holds c = sum_h dL/dout_h * out_h, gy_ptr the HV dL/dout_h
         o = tl.load(out_ptr + st, mask=nm, other=0.0).to(ACC)
-        gyv = tl.load(gy_ptr + st, mask=nm, other=0.0).to(ACC)
+        if HV > 1:
+            gy3 = tl.load(gy_ptr + st3, mask=nm3, other=0.0).to(ACC)
+        else:
+            gyv = tl.load(gy_ptr + st, mask=nm, other=0.0).to(ACC)
     else:
-        num = tl.load(num_ptr + st, mask=nm, other=0.0).to(ACC)
+        if HV > 1:
+            num3 = tl.load(num_ptr + st3, mask=nm3, other=0.0).to(ACC)
+        else:
+            num = tl.load(num_ptr + st, mask=nm, other=0.0).to(ACC)
 
     # columns are all real rows/phases: interior chunks need no bounds checks at all
-    full_cols = (tl.program_id(0) * BR + BR <= R) & (p0 + PB <= DIL)
+    full_cols = (rb * BR + BR <= R) & (p0 + PB <= DIL)
     t_off = u[:, None] * BV + tl.arange(0, BV)[None, :]
     tile = BU * BV
-    prog = tl.program_id(0) * tl.num_programs(1) + tid      # theta partials: one slot per program
+    prog = rb * tl.num_programs(1) + tid    # theta partials: one slot per program (and stage scale)
     if WIN > 0:
         # short filters: the whole input window of the tile (BU + KT - 1 <= WIN samples per
         # column) is loaded once and shared by every frequency; tiles are (S, 2, BU, WIN)
@@ -164,7 +180,8 @@ def _spectral_softmax_kernel(
         tw_off = u[:, None] * WIN + tl.arange(0, WIN)[None, :]
         if GRAD and FUSE_GX:
             gXw = tl.zeros([WIN, PB * BR], ACC)
-    for s in range(0, S):
+    for s_l in range(0, S):
+        s = sb + s_l  # stage scale index
         klo = tl.load(kf_ptr + 2 * s)
         khi = tl.load(kf_ptr + 2 * s + 1)
         gi = tl.load(gidx_ptr + s)
@@ -197,13 +214,40 @@ def _spectral_softmax_kernel(
 
         mag = tl.sqrt(re * re + im * im)
         a = mag * INV_TAU
-        if V_PER_POS:
+        if HV > 1:
+            if V_PER_POS:
+                v_off3 = hv[:, None, None] * SV_H + (v_col[None, :] + gi * SV_F + n * SV_N)[None, :, :]
+                val3 = tl.load(v_ptr + v_off3, mask=nm3, other=0.0).to(ACC)
+            else:
+                v_off2 = hv[:, None] * SV_H + (v_col + gi * SV_F)[None, :]
+                vm2 = col_ok[None, :] & (hv < HV)[:, None]
+                val3 = tl.load(v_ptr + v_off2, mask=vm2, other=0.0).to(ACC)[:, None, :]
+        elif V_PER_POS:
             v_off = v_col[None, :] + gi * SV_F + n * SV_N
             val = tl.load(v_ptr + v_off, mask=nm, other=0.0).to(ACC)
         else:
             val = tl.load(v_ptr + v_col + gi * SV_F, mask=col_ok, other=0.0).to(ACC)[None, :]
 
-        if GRAD:
+        if GRAD and HV > 1:
+            # out_h = sum_f p_f V_hf  =>  dL/da_f = p_f * (sum_h gy_h V_hf - sum_h gy_h out_h)
+            pf = tl.where(nm, tl.exp(a - m) / l, 0.0)
+            gp3 = pf[None, :, :] * gy3
+            if V_PER_POS:
+                if V_GROUPED:
+                    gsum = tl.sum(tl.reshape(gp3, [HV, BU, BR, PB]), axis=2)       # [HV, BU, PB]
+                    ph = tl.arange(0, PB)
+                    n2 = p0 + ph[None, :] + DIL * (u0 + u)[:, None]
+                    g0 = (rb * BR + ROW0) // NCH
+                    m2 = (n2 < N_OUT) & (p0 + ph < DIL)[None, :]
+                    g_off = hv[:, None, None] * SV_H + (g0 * SV_G + gi * SV_F + n2 * SV_N)[None, :, :]
+                    tl.atomic_add(gv_ptr + g_off, gsum, mask=m2[None, :, :] & (hv < HV)[:, None, None])
+                else:
+                    tl.atomic_add(gv_ptr + v_off3, gp3, mask=nm3)
+            else:
+                tl.atomic_add(gv_ptr + v_off2, tl.sum(gp3, axis=1), mask=vm2)
+            inv = tl.where(mag > 0, 1.0 / tl.where(mag > 0, mag, 1.0), 0.0)
+            coef = pf * (tl.sum(gy3 * val3, axis=0) - o) * INV_TAU * inv
+        elif GRAD:
             pf = tl.where(nm, tl.exp(a - m) / l, 0.0)
             gp = gyv * pf
             if V_PER_POS:
@@ -213,7 +257,7 @@ def _spectral_softmax_kernel(
                     gsum = tl.sum(tl.reshape(gp, [BU, BR, PB]), axis=1)          # [BU, PB]
                     ph = tl.arange(0, PB)
                     n2 = p0 + ph[None, :] + DIL * (u0 + u)[:, None]
-                    g0 = (tl.program_id(0) * BR + ROW0) // NCH
+                    g0 = (rb * BR + ROW0) // NCH
                     m2 = (n2 < N_OUT) & (p0 + ph < DIL)[None, :]
                     tl.atomic_add(gv_ptr + g0 * SV_G + gi * SV_F + n2 * SV_N, gsum, mask=m2)
                 else:
@@ -222,6 +266,7 @@ def _spectral_softmax_kernel(
                 tl.atomic_add(gv_ptr + v_col + gi * SV_F, tl.sum(gp, axis=0), mask=col_ok)
             inv = tl.where(mag > 0, 1.0 / tl.where(mag > 0, mag, 1.0), 0.0)
             coef = gp * (val - o) * INV_TAU * inv
+        if GRAD:
             g_re = coef * re                                      # dL/dRe W, dL/dIm W
             g_im = coef * im
             if WRITE_GW:
@@ -239,10 +284,10 @@ def _spectral_softmax_kernel(
                     A += g_im * _dot(tl.load(d_re + BU * WIN), Xw, ACC, PRECISION)
                     tl.store(gth_ptr + s * S_TOT + prog, tl.sum(tl.sum(A, axis=1), axis=0))
                 if NT > 1:
-                    d_re2 = d_re + S * 2 * (BU * WIN)
+                    d_re2 = d_re + S_ST * 2 * (BU * WIN)
                     A = g_re * _dot(tl.load(d_re2), Xw, ACC, PRECISION)
                     A += g_im * _dot(tl.load(d_re2 + BU * WIN), Xw, ACC, PRECISION)
-                    tl.store(gth_ptr + (S + s) * S_TOT + prog, tl.sum(tl.sum(A, axis=1), axis=0))
+                    tl.store(gth_ptr + (S_ST + s) * S_TOT + prog, tl.sum(tl.sum(A, axis=1), axis=0))
             elif FUSE_GX or NT > 0:
                 # adjoint of the banded-Toeplitz product, chunk by chunk:
                 #   dL/dX[v] = T_re^T dL/dRe W + T_im^T dL/dIm W     (scattered into gx)
@@ -267,20 +312,23 @@ def _spectral_softmax_kernel(
                         A += _dot(tl.trans(tl.load(d_re + NCHUNK * tile)), g_im, ACC, PRECISION)
                         th0 += A * X
                         if NT > 1:
-                            d_re2 = d_re + S * 2 * NCHUNK * tile
+                            d_re2 = d_re + S_ST * 2 * NCHUNK * tile
                             A = _dot(tl.trans(tl.load(d_re2)), g_re, ACC, PRECISION)
                             A += _dot(tl.trans(tl.load(d_re2 + NCHUNK * tile)), g_im, ACC, PRECISION)
                             th1 += A * X
                 if NT > 0:
                     tl.store(gth_ptr + s * S_TOT + prog, tl.sum(tl.sum(th0, axis=1), axis=0))
                 if NT > 1:
-                    tl.store(gth_ptr + (S + s) * S_TOT + prog, tl.sum(tl.sum(th1, axis=1), axis=0))
+                    tl.store(gth_ptr + (S_ST + s) * S_TOT + prog, tl.sum(tl.sum(th1, axis=1), axis=0))
         else:
             m_new = tl.maximum(m, a)
             alpha = tl.exp(m - m_new)
             e = tl.exp(a - m_new)
             l = l * alpha + e
-            num = num * alpha + e * val
+            if HV > 1:
+                num3 = num3 * alpha[None, :, :] + e[None, :, :] * val3
+            else:
+                num = num * alpha + e * val
             m = m_new
 
     if GRAD and FUSE_GX and WIN > 0:
@@ -288,7 +336,10 @@ def _spectral_softmax_kernel(
     if not GRAD:
         tl.store(m_ptr + st, m.to(m_ptr.dtype.element_ty), mask=nm)
         tl.store(l_ptr + st, l.to(l_ptr.dtype.element_ty), mask=nm)
-        tl.store(num_ptr + st, num.to(num_ptr.dtype.element_ty), mask=nm)
+        if HV > 1:
+            tl.store(num_ptr + st3, num3.to(num_ptr.dtype.element_ty), mask=nm3)
+        else:
+            tl.store(num_ptr + st, num.to(num_ptr.dtype.element_ty), mask=nm)
 
 
 def band_tiles(h, kf, n_out: int, dil: int, precision: str, window: bool = True, bu=None):
@@ -334,35 +385,41 @@ def band_tiles(h, kf, n_out: int, dil: int, precision: str, window: bool = True,
 
 def _launch(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, row0, inv_tau, off, dil, precision,
             m, l, num, out, gy, gw, gv, grad, gx=None, ttiles=None, gth=None, nt=0, write_gw=True,
-            num_warps=None):
+            num_warps=None, banks=1, hv=1):
     tb, bu, n_chunks, win = tiles
     K, n_chunks = (n_chunks, 0) if win else (0, n_chunks)
     fused = grad and (gx is not None or nt > 0)
     cols = WIN_BWD_COLS if (win and fused) else COLS
+    if hv > 1:  # HV live numerators / gradients per column: narrower tiles
+        cols = max(16, cols // hv)
     R, n_in = x.shape
     n_out = m.shape[1]
-    S = gidx.numel()
+    S_st = gidx.numel()
+    S = S_st // banks
     if R == 0 or n_out == 0 or S == 0:
         return
+    if banks > 1 or hv > 1:
+        assert not (grad and write_gw), "dL/dW is not materialised with filter banks / value heads"
     pb = min(triton.next_power_of_2(dil), 8)
     br = max(16 // pb, min(cols // pb, triton.next_power_of_2(R)))
     n_pb = triton.cdiv(dil, pb)
     n_ub = triton.cdiv(triton.cdiv(n_out, dil), bu)
-    grid = (triton.cdiv(R, br), n_pb * n_ub)
+    n_rb = triton.cdiv(R, br)
+    grid = (n_rb * banks, n_pb * n_ub)
     # V rows shared by NCH consecutive signal rows: a tile's rows all fall in one V row
     v_grouped = bool(v_per_pos and grad and nch % br == 0 and row0 % br == 0)
     fuse_gx = gx is not None
-    n_prog = grid[0] * grid[1]
+    n_prog = n_rb * grid[1]
     # dL/dtheta: per-program partial sums (same-address atomics from every program serialise)
-    part = torch.empty((nt, S, n_prog), device=x.device, dtype=gth.dtype) if nt else None
+    part = torch.empty((nt, S_st, n_prog), device=x.device, dtype=gth.dtype) if nt else None
     _spectral_softmax_kernel[grid](
         x, tb, kf, gidx, v, m, l, num, out, gy, gw, gv,
         gx if fuse_gx else x, ttiles if nt else tb, part if nt else m,
         R, n_in, n_out, off, dil, S, n_chunks, nch, row0, inv_tau, n_pb, *v_strides,
-        n_prog, K,
+        n_prog, K, n_rb, S_st, m.numel(),
         ACC=_acc(x.dtype), GRAD=grad, V_PER_POS=v_per_pos, PRECISION=precision,
         BU=bu, BV=BV, PB=pb, BR=br, WRITE_GW=bool(grad and write_gw), FUSE_GX=fuse_gx, NT=nt,
-        V_GROUPED=v_grouped, WIN=win, num_warps=num_warps or NUM_WARPS,
+        V_GROUPED=v_grouped, WIN=win, HV=hv, num_warps=num_warps or NUM_WARPS,
         num_stages=(1 if x.dtype == torch.float64 else WIN_STAGES) if win else NUM_STAGES,
     )
     if nt:
@@ -370,18 +427,21 @@ def _launch(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, row0, inv_tau, off
 
 
 def forward_stage(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, inv_tau, off, dil, precision,
-                  m, l, num):
-    """Fold one octave into the online-softmax state (m, l, num), each (R, N_OUT).
+                  m, l, num, banks=1, hv=1):
+    """Fold one octave into the online-softmax state (m, l, num): m and l ``(banks * R, N_OUT)``,
+    num ``(hv, banks * R, N_OUT)``.
 
     ``tiles`` comes from :func:`band_tiles`, ``kf`` holds the (S, 2) tap ranges and
-    ``gidx`` the global frequency indices of the octave.
+    ``gidx`` the global frequency indices of the octave (bank-major with ``banks`` filter banks:
+    the octave's ``S / banks`` scales of bank 0, then of bank 1, ...).  ``hv`` value heads share
+    the softmax; ``v_strides`` = ``(SV_G, SV_C, SV_F, SV_N, SV_H)``.
     """
     _launch(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, 0, inv_tau, off, dil, precision,
-            m, l, num, m, m, m, m, grad=False)
+            m, l, num, m, m, m, m, grad=False, banks=banks, hv=hv)
 
 
 def backward_stage(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, row0, inv_tau, off, dil,
-                   precision, m, l, out, gy, gw, gv, gx=None, ttiles=None, gth=None):
+                   precision, m, l, out, gy, gw, gv, gx=None, ttiles=None, gth=None, banks=1, hv=1):
     """Backward of one octave: accumulates gv (= dL/dV) and, as requested,
 
     * writes ``gw`` (R, S, N_OUT, 2) = dL/dW (for the grad-x / grad-h kernels), if not None;
@@ -389,12 +449,15 @@ def backward_stage(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, row0, inv_t
     * accumulates ``gth[t, f] += dL/dtheta_t`` for the filter tangents ``ttiles``
       (``(T, S, 2, ...)`` tiles of dH/dtheta_t, ``gth`` of shape ``(T, S_TOT)``), from
       per-program partial sums.
+
+    With ``hv > 1`` value heads, ``gy`` is ``(hv, banks * R, N_OUT)`` and ``out`` holds
+    ``sum_h gy_h * out_h``.  Filter banks and value heads need the fused paths (``gw`` None).
     """
     nt = 0 if ttiles is None else ttiles.shape[0]
     _launch(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, row0, inv_tau, off, dil, precision,
             m, l, m, out, gy, gw if gw is not None else m, gv, grad=True, gx=gx, ttiles=ttiles,
             gth=gth, nt=nt, write_gw=gw is not None,
-            num_warps=BWD_NUM_WARPS if (gx is not None or nt) else None)
+            num_warps=BWD_NUM_WARPS if (gx is not None or nt) else None, banks=banks, hv=hv)
 
 
 # --------------------------------------------------------------------------- sweep backward
@@ -402,9 +465,10 @@ def backward_stage(x, tiles, kf, gidx, v, v_strides, v_per_pos, nch, row0, inv_t
 
 @triton.jit
 def _sweep_tile_loads(m_ptr, l_ptr, out_ptr, gy_ptr, x_col, xpos0, col_ok, lr, p, p0, u, u0, q, KT, DIL, N_IN,
-                      N_OUT, ACC: tl.constexpr, BV: tl.constexpr, NCU: tl.constexpr, ML_PRE: tl.constexpr):
+                      N_OUT, NV, ACC: tl.constexpr, BV: tl.constexpr, NCU: tl.constexpr, ML_PRE: tl.constexpr,
+                      HV: tl.constexpr):
     """Softmax state (log-denominator m + log l, out, dL/dout) and the NCU shared input chunks of
-    the output tile starting at u0."""
+    the output tile starting at u0 (HV > 1: dL/dout is ``[HV, BU, COLS]``, out is sum_h gy_h out_h)."""
     n = p0 + p[None, :] + DIL * (u0 + u)[:, None]
     nm = (n < N_OUT) & col_ok[None, :]
     st = lr[None, :] * N_OUT + n
@@ -413,7 +477,7 @@ def _sweep_tile_loads(m_ptr, l_ptr, out_ptr, gy_ptr, x_col, xpos0, col_ok, lr, p
     else:
         ml = tl.load(m_ptr + st, mask=nm, other=0.0).to(ACC) + tl.log(tl.load(l_ptr + st, mask=nm, other=1.0).to(ACC))
     o = tl.load(out_ptr + st, mask=nm, other=0.0).to(ACC)
-    gyv = tl.load(gy_ptr + st, mask=nm, other=0.0).to(ACC)
+    gyv = _load_gy(gy_ptr, st, nm, NV, ACC, HV)
     vA = u0 + q - KT + 1 + tl.arange(0, BV)
     posA = xpos0[None, :] + DIL * vA[:, None]
     xA = x_col[None, :] + DIL * vA[:, None]
@@ -426,6 +490,17 @@ def _sweep_tile_loads(m_ptr, l_ptr, out_ptr, gy_ptr, x_col, xpos0, col_ok, lr, p
     else:
         X2 = X0
     return ml, o, gyv, X0, X1, X2
+
+
+@triton.jit
+def _load_gy(gy_ptr, st, nm, NV, ACC: tl.constexpr, HV: tl.constexpr):
+    """dL/dout of a tile: ``[BU, COLS]``, or ``[HV, BU, COLS]`` for HV value heads (stride NV)."""
+    if HV > 1:
+        hv = tl.arange(0, HV)
+        return tl.load(gy_ptr + hv[:, None, None] * NV + st[None, :, :], mask=nm[None, :, :] & (hv < HV)[:, None, None],
+                       other=0.0).to(ACC)
+    else:
+        return tl.load(gy_ptr + st, mask=nm, other=0.0).to(ACC)
 
 
 @triton.jit
@@ -443,18 +518,22 @@ def _spectral_softmax_bwd_sweep_kernel(
     x_ptr, tb_ptr, ta_ptr, tt_ptr, kf_ptr, gidx_ptr, v_ptr,
     m_ptr, l_ptr, out_ptr, gy_ptr, gv_ptr, gx_ptr, part_ptr,
     R, N_IN, N_OUT, OFF, DIL, NCHUNK, NCH, INV_TAU, N_PB, N_UT, KT, P_TOT, T_SEG,
-    SV_G, SV_C, SV_F, SV_N,
+    SV_G, SV_C, SV_F, SV_N, SV_H, N_RB, S_ST, NV, GX_BANK,
     ACC: tl.constexpr, V_PER_POS: tl.constexpr, PRECISION: tl.constexpr,
     BU: tl.constexpr, BV: tl.constexpr, PB: tl.constexpr, BR: tl.constexpr,
     NT: tl.constexpr, V_GROUPED: tl.constexpr, ACCUM: tl.constexpr, NCU: tl.constexpr,
     NCARRY: tl.constexpr, PREFETCH: tl.constexpr, RELAX: tl.constexpr, ML_PRE: tl.constexpr,
-    FAST: tl.constexpr, S: tl.constexpr,
+    FAST: tl.constexpr, S: tl.constexpr, HV: tl.constexpr,
 ):
     # NCU > 0: every frequency's tiles share the octave's alignment (tap range [0, KT)) and span
     # NCU (2 or 3) BV chunks: the input chunks of an output tile are loaded once for all the
     # frequencies, and the filter tangents are convolved in the same pass
     # (dL/dtheta = sum dL/dW * (dT X), no transposed tiles, no reload).
-    pid0 = tl.program_id(0)
+    # grid axis 0 = (filter bank, row block), as in _spectral_softmax_kernel; each bank writes its
+    # own dL/dx buffer (GX_BANK apart), summed by the caller
+    hb = tl.program_id(0) // N_RB
+    pid0 = tl.program_id(0) - hb * N_RB
+    sb = hb * S
     tid = tl.program_id(1)
     # the output tiles of a row are split into segments of T_SEG tiles (grid axis 2), so that short
     # rows still fill the GPU; the first NCARRY input tiles of a segment also receive the previous
@@ -473,12 +552,15 @@ def _spectral_softmax_bwd_sweep_kernel(
     rho = OFF - q * DIL
     # one 64-bit base per program (its first row), 32-bit offsets inside it
     row0 = (pid0 * BR).to(tl.int64)
+    srow0 = row0 + hb * R  # softmax-state row of this bank
     x_ptr += row0 * N_IN
-    gx_ptr += row0 * N_IN
-    m_ptr += row0 * N_OUT
-    l_ptr += row0 * N_OUT
-    out_ptr += row0 * N_OUT
-    gy_ptr += row0 * N_OUT
+    gx_ptr += row0 * N_IN + hb * GX_BANK
+    m_ptr += srow0 * N_OUT
+    l_ptr += srow0 * N_OUT
+    out_ptr += srow0 * N_OUT
+    gy_ptr += srow0 * N_OUT
+    if HV > 1:
+        hv = tl.arange(0, HV)
     lr = pr // PB
     x_off = lr * N_IN + p0 + p + rho
     x_col = x_ptr + x_off
@@ -496,7 +578,7 @@ def _spectral_softmax_bwd_sweep_kernel(
     if PREFETCH:  # software pipelining: the next tile's loads are in flight during this tile's math
         ml_n, o_n, gy_n, X0n, X1n, X2n = _sweep_tile_loads(
             m_ptr, l_ptr, out_ptr, gy_ptr, x_col, xpos0, col_ok, lr, p, p0, u, t_start * BU, q, KT, DIL, N_IN,
-            N_OUT, ACC, BV, NCU, ML_PRE)
+            N_OUT, NV, ACC, BV, NCU, ML_PRE, HV)
     for t in range(t_start, t_end + NCARRY):
         u0 = t * BU
         acc = carry
@@ -509,11 +591,11 @@ def _spectral_softmax_bwd_sweep_kernel(
                 ml, o, gyv, X0, X1, X2 = ml_n, o_n, gy_n, X0n, X1n, X2n
                 ml_n, o_n, gy_n, X0n, X1n, X2n = _sweep_tile_loads(
                     m_ptr, l_ptr, out_ptr, gy_ptr, x_col, xpos0, col_ok, lr, p, p0, u, u0 + BU, q, KT, DIL, N_IN,
-                    N_OUT, ACC, BV, NCU, ML_PRE)
+                    N_OUT, NV, ACC, BV, NCU, ML_PRE, HV)
             elif NCU > 0:
                 ml, o, gyv, X0, X1, X2 = _sweep_tile_loads(
                     m_ptr, l_ptr, out_ptr, gy_ptr, x_col, xpos0, col_ok, lr, p, p0, u, u0, q, KT, DIL, N_IN, N_OUT,
-                    ACC, BV, NCU, ML_PRE)
+                    NV, ACC, BV, NCU, ML_PRE, HV)
             else:
                 st = lr[None, :] * N_OUT + n
                 # log of the softmax denominator, m + log l: one live tile instead of two
@@ -523,8 +605,9 @@ def _spectral_softmax_bwd_sweep_kernel(
                     ml = tl.load(m_ptr + st, mask=nm, other=0.0).to(ACC) + tl.log(
                         tl.load(l_ptr + st, mask=nm, other=1.0).to(ACC))
                 o = tl.load(out_ptr + st, mask=nm, other=0.0).to(ACC)
-                gyv = tl.load(gy_ptr + st, mask=nm, other=0.0).to(ACC)
-            for s in range(0, S):
+                gyv = _load_gy(gy_ptr, st, nm, NV, ACC, HV)
+            for s_l in range(0, S):
+                s = sb + s_l  # stage scale index
                 klo = tl.load(kf_ptr + 2 * s)
                 khi = tl.load(kf_ptr + 2 * s + 1)
                 gi = tl.load(gidx_ptr + s)
@@ -539,7 +622,7 @@ def _spectral_softmax_bwd_sweep_kernel(
                         i0t = _conv_u(d_re + NCHUNK * tile, tile, X0, X1, X2 if NCU > 2 else X0,
                                       NCU, ACC, PRECISION)
                     if NT > 1:
-                        d2 = d_re + S * 2 * NCHUNK * tile
+                        d2 = d_re + S_ST * 2 * NCHUNK * tile
                         r1t = _conv_u(d2, tile, X0, X1, X2 if NCU > 2 else X0, NCU, ACC, PRECISION)
                         i1t = _conv_u(d2 + NCHUNK * tile, tile, X0, X1, X2 if NCU > 2 else X0,
                                       NCU, ACC, PRECISION)
@@ -571,17 +654,44 @@ def _spectral_softmax_bwd_sweep_kernel(
                 else:
                     mag = tl.sqrt(sq)
                 a = mag * INV_TAU
-                if V_PER_POS:
-                    v_off = v_col[None, :] + gi * SV_F + n * SV_N
-                    val = tl.load(v_ptr + v_off, mask=nm, other=0.0).to(ACC)
-                else:
-                    val = tl.load(v_ptr + v_col + gi * SV_F, mask=col_ok, other=0.0).to(ACC)[None, :]
                 if FAST:
                     pf = tl.where(nm, tl.exp2((a - ml) * 1.4426950408889634), 0.0)
                 else:
                     pf = tl.where(nm, tl.exp(a - ml), 0.0)
-                gp = gyv * pf
-                if V_PER_POS:
+                if HV > 1:
+                    # value heads (see _spectral_softmax_kernel): gyv is [HV, BU, COLS], o = sum_h gy_h out_h
+                    gp3 = pf[None, :, :] * gyv
+                    if V_PER_POS:
+                        v_off3 = hv[:, None, None] * SV_H + (v_col[None, :] + gi * SV_F + n * SV_N)[None, :, :]
+                        nm3 = nm[None, :, :] & (hv < HV)[:, None, None]
+                        val3 = tl.load(v_ptr + v_off3, mask=nm3, other=0.0).to(ACC)
+                        if V_GROUPED:
+                            gsum = tl.sum(tl.reshape(gp3, [HV, BU, BR, PB]), axis=2)
+                            ph = tl.arange(0, PB)
+                            n2 = p0 + ph[None, :] + DIL * (u0 + u)[:, None]
+                            g0 = (pid0 * BR) // NCH
+                            m2 = (n2 < N_OUT) & (p0 + ph < DIL)[None, :]
+                            g_off = hv[:, None, None] * SV_H + (g0 * SV_G + gi * SV_F + n2 * SV_N)[None, :, :]
+                            tl.atomic_add(gv_ptr + g_off, gsum, mask=m2[None, :, :] & (hv < HV)[:, None, None],
+                                          sem="relaxed")
+                        else:
+                            tl.atomic_add(gv_ptr + v_off3, gp3, mask=nm3, sem="relaxed")
+                    else:
+                        v_off2 = hv[:, None] * SV_H + (v_col + gi * SV_F)[None, :]
+                        vm2 = col_ok[None, :] & (hv < HV)[:, None]
+                        val3 = tl.load(v_ptr + v_off2, mask=vm2, other=0.0).to(ACC)[:, None, :]
+                        tl.atomic_add(gv_ptr + v_off2, tl.sum(gp3, axis=1), mask=vm2, sem="relaxed")
+                    gp = pf
+                    val = tl.sum(gyv * val3, axis=0)  # coef below: pf * (sum_h gy_h V_hf - o)
+                elif V_PER_POS:
+                    v_off = v_col[None, :] + gi * SV_F + n * SV_N
+                    val = tl.load(v_ptr + v_off, mask=nm, other=0.0).to(ACC)
+                else:
+                    val = tl.load(v_ptr + v_col + gi * SV_F, mask=col_ok, other=0.0).to(ACC)[None, :]
+                if HV > 1:
+                    pass
+                elif V_PER_POS:
+                    gp = gyv * pf
                     if V_GROUPED:
                         gsum = tl.sum(tl.reshape(gp, [BU, BR, PB]), axis=1)
                         ph = tl.arange(0, PB)
@@ -596,10 +706,12 @@ def _spectral_softmax_bwd_sweep_kernel(
                         tl.atomic_add(gv_ptr + v_off, gp, mask=nm, sem="relaxed")
                     else:
                         tl.atomic_add(gv_ptr + v_off, gp, mask=nm)
-                elif RELAX:
-                    tl.atomic_add(gv_ptr + v_col + gi * SV_F, tl.sum(gp, axis=0), mask=col_ok, sem="relaxed")
                 else:
-                    tl.atomic_add(gv_ptr + v_col + gi * SV_F, tl.sum(gp, axis=0), mask=col_ok)
+                    gp = gyv * pf
+                    if RELAX:
+                        tl.atomic_add(gv_ptr + v_col + gi * SV_F, tl.sum(gp, axis=0), mask=col_ok, sem="relaxed")
+                    else:
+                        tl.atomic_add(gv_ptr + v_col + gi * SV_F, tl.sum(gp, axis=0), mask=col_ok)
                 if not FAST:
                     inv = tl.where(mag > 0, 1.0 / tl.where(mag > 0, mag, 1.0), 0.0)
                 coef = gp * (val - o) * INV_TAU * inv
@@ -615,10 +727,10 @@ def _spectral_softmax_bwd_sweep_kernel(
                     carry2 += _dot(tl.load(a_re + 4 * BU * BU), g_re, ACC, PRECISION)
                     carry2 += _dot(tl.load(a_re + 5 * BU * BU), g_im, ACC, PRECISION)
                 if NCU > 0 and NT > 0:
-                    slot = (prog * N_UT + t) * S + s
+                    slot = (prog * N_UT + t) * S_ST + s
                     tl.store(part_ptr + slot, tl.sum(tl.sum(g_re * r0t + g_im * i0t, axis=1), axis=0))
                     if NT > 1:
-                        tl.store(part_ptr + P_TOT * N_UT * S + slot,
+                        tl.store(part_ptr + P_TOT * N_UT * S_ST + slot,
                                  tl.sum(tl.sum(g_re * r1t + g_im * i1t, axis=1), axis=0))
                 elif NT > 0:
                     th0 = tl.zeros([BV, PB * BR], ACC)
@@ -634,14 +746,14 @@ def _spectral_softmax_bwd_sweep_kernel(
                         A += _dot(tl.trans(tl.load(d_re + NCHUNK * tile)), g_im, ACC, PRECISION)
                         th0 += A * X
                         if NT > 1:
-                            d2 = d_re + S * 2 * NCHUNK * tile
+                            d2 = d_re + S_ST * 2 * NCHUNK * tile
                             A = _dot(tl.trans(tl.load(d2)), g_re, ACC, PRECISION)
                             A += _dot(tl.trans(tl.load(d2 + NCHUNK * tile)), g_im, ACC, PRECISION)
                             th1 += A * X
-                    slot = (prog * N_UT + t) * S + s
+                    slot = (prog * N_UT + t) * S_ST + s
                     tl.store(part_ptr + slot, tl.sum(tl.sum(th0, axis=1), axis=0))
                     if NT > 1:
-                        tl.store(part_ptr + P_TOT * N_UT * S + slot, tl.sum(tl.sum(th1, axis=1), axis=0))
+                        tl.store(part_ptr + P_TOT * N_UT * S_ST + slot, tl.sum(tl.sum(th1, axis=1), axis=0))
         # input tile I_t starts at v = u0 + q - KT + 1 (input lattice of the phase)
         vI = u0 + q - KT + 1 + u
         posI = xpos0[None, :] + DIL * vI[:, None]
@@ -675,7 +787,7 @@ def adjoint_tiles(h, bu, dtype, ncarry: int = 1):
 
 def backward_stage_sweep(x, tiles, h, kf, gidx, v, v_strides, v_per_pos, nch, inv_tau, off, dil, precision,
                          m, l, out, gy, gv, gx, accumulate, ttiles=None, gth=None, ml=None, uniform=None,
-                         ta=None, taps=None):
+                         ta=None, taps=None, banks=1, hv=1):
     """Atomic-free fused backward of one octave (short filters, ``K <= BU + 1``).
 
     A program owns ``BR`` rows x ``PB`` phases and walks their output tiles in order: it
@@ -689,6 +801,9 @@ def backward_stage_sweep(x, tiles, h, kf, gidx, v, v_strides, v_per_pos, nch, in
     window=False)``), ``ttiles`` likewise.  ``ta`` / ``taps``: the :func:`adjoint_tiles` and
     the number of taps, prebuilt (then ``h`` is not needed); ``uniform``: whether ``kf`` is
     the common tap range (:func:`sweep_uniform`; otherwise read back from the device).
+
+    ``banks`` filter banks / ``hv`` value heads as in :func:`backward_stage`; with ``banks > 1``,
+    ``gx`` is ``(banks, R, N_IN)`` (one dL/dx per bank, to be summed).
     """
     tb, bu, n_chunks, win = tiles
     if win:
@@ -701,38 +816,43 @@ def backward_stage_sweep(x, tiles, h, kf, gidx, v, v_strides, v_per_pos, nch, in
     if K > 2 * bu + 1:
         raise ValueError(f"the sweep backward needs K <= {2 * bu + 1} taps, got {K}")
     ncarry = 1 if K <= bu + 1 else 2
-    S = gidx.numel()
+    S_st = gidx.numel()
+    S = S_st // banks
     if R == 0 or n_out == 0 or S == 0:
         return
     cols, warps = SWEEP_SMALL_CFG[ncarry] if bu == SWEEP_SMALL_BU else (SWEEP_COLS, SWEEP_NUM_WARPS)
+    if hv > 1:
+        cols = max(16, cols // hv)
     pb = min(triton.next_power_of_2(dil), 8)
     br = max(16 // pb, min(cols // pb, triton.next_power_of_2(R)))
     n_pb = triton.cdiv(dil, pb)
     n_ut = triton.cdiv(triton.cdiv(n_out, dil), bu)
-    P = triton.cdiv(R, br) * n_pb
+    n_rb = triton.cdiv(R, br)
+    P = n_rb * n_pb
     # segments per row: enough programs for SWEEP_MIN_PROGRAMS_PER_SM per SM, segments of at least
     # SWEEP_MIN_SEG_TILES tiles (a boundary costs NCARRY atomic tiles)
     want = SWEEP_MIN_PROGRAMS_PER_SM * torch.cuda.get_device_properties(x.device).multi_processor_count
-    n_seg = max(1, min(triton.cdiv(want, P), n_ut // max(1, SWEEP_MIN_SEG_TILES)))
+    n_seg = max(1, min(triton.cdiv(want, P * banks), n_ut // max(1, SWEEP_MIN_SEG_TILES)))
     t_seg = triton.cdiv(n_ut, n_seg)
     n_seg = triton.cdiv(n_ut, t_seg)
-    grid = (triton.cdiv(R, br), n_pb, n_seg)
+    grid = (n_rb * banks, n_pb, n_seg)
     if ta is None:
         ta = adjoint_tiles(h, bu, tb.dtype, ncarry)
     nt = 0 if ttiles is None else ttiles.shape[0]
     if uniform is None:  # reads kf back from the device: pass it to keep the stream asynchronous
         uniform = bool((kf[:, 0] == 0).all()) and bool((kf[:, 1] == K).all())
     ncu = n_chunks if (SWEEP_UNI and 2 <= n_chunks <= 3 and uniform) else 0
-    part = torch.empty((max(nt, 1), P * n_ut * S), device=x.device, dtype=gv.dtype)
+    part = torch.empty((max(nt, 1), P * n_ut * S_st), device=x.device, dtype=gv.dtype)
     ml_pre = bool(SWEEP_ML_PRE and ml is not None)
     _spectral_softmax_bwd_sweep_kernel[grid](
         x, tb, ta, ttiles if nt else tb, kf, gidx, v, ml if ml_pre else m, l, out, gy, gv, gx, part,
         R, n_in, n_out, off, dil, n_chunks, nch, inv_tau, n_pb, n_ut, K, P, t_seg, *v_strides,
+        n_rb, S_st, m.numel(), R * n_in if banks > 1 else 0,
         ACC=_acc(x.dtype), V_PER_POS=v_per_pos, PRECISION=precision, BU=bu, BV=BV, PB=pb, BR=br,
         NT=nt, V_GROUPED=bool(v_per_pos and nch % br == 0), ACCUM=bool(accumulate), NCU=ncu, NCARRY=ncarry,
         PREFETCH=bool(SWEEP_PREFETCH and ncu), RELAX=bool(SWEEP_RELAX), ML_PRE=ml_pre,
-        FAST=bool(SWEEP_FAST and x.dtype != torch.float64), S=S,
+        FAST=bool(SWEEP_FAST and x.dtype != torch.float64), S=S, HV=hv,
         num_warps=warps, num_stages=SWEEP_STAGES, **({"maxnreg": SWEEP_MAXNREG} if SWEEP_MAXNREG else {}),
     )
     if nt:
-        gth.index_add_(1, gidx.long(), part.view(nt, P * n_ut, S).sum(1))
+        gth.index_add_(1, gidx.long(), part.view(nt, P * n_ut, S_st).sum(1))

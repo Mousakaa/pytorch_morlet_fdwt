@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import fdwt
-from fdwt.cwt import spectral_softmax, spectral_softmax_params
+from fdwt.cwt import MorletPlan, spectral_softmax, spectral_softmax_params
 from fdwt.kernels import softmax as KS
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -220,3 +220,55 @@ def test_filter_tangents_match_jvp(norm, complex_):
            torch.func.jvp(fn, (ls, w), (torch.zeros_like(ls), torch.ones_like(w)))[1]]
     for a, b in zip(p.filter_tangents(ls, w, torch.float64), ref):
         torch.testing.assert_close(a, b, atol=1e-14 * b.abs().max().item(), rtol=0)
+
+
+@cuda
+@pytest.mark.parametrize("banks,heads", [(4, None), (1, 4), (1, 3), (2, 2)])
+@pytest.mark.parametrize("per_position,nch", [(False, 1), (False, 8), (True, 8), (True, 64)])
+@pytest.mark.parametrize("replan,sweep", [(False, "auto"), (True, False), (True, "auto")])
+def test_banks_and_value_heads_match_cpu(banks, heads, per_position, nch, replan, sweep, config_restore):
+    # filter banks (own scales and w0 per bank, one launch per octave) and value heads (one
+    # softmax, several value sets) against the plain PyTorch path; nch=64 takes the grouped
+    # dL/dV atomics, heads=3 the zero-padded head axis
+    torch.manual_seed(0)
+    m = fdwt.CWT1D(freqs=torch.logspace(0, 1.2, 16).tolist(), fs=64, learnable=True, learnable_w0=True,
+                   banks=banks)
+    with torch.no_grad():  # banks that drifted apart, as after training
+        m.log_scales.add_(0.1 * torch.randn_like(m.log_scales) - (2.0 if replan else 0.0))
+        m.w0.copy_(torch.linspace(5.5, 6.5, banks) if banks > 1 else torch.tensor(0.7 if replan else 6.0))
+    m = m.cuda()
+    if replan:
+        m.replan()
+    assert m.plan.banks == banks
+    S, hv = m.plan.num_scales, heads or 1
+    R, N = 2 * nch if per_position else 48, 300
+    dt = torch.float64
+    x = torch.randn(R, N, device="cuda", dtype=dt, requires_grad=True)
+    vshape = (R // nch, hv, S, N) if per_position else (hv, nch, S)
+    if heads is None:
+        vshape = vshape[:1] + vshape[2:] if per_position else vshape[1:]
+    V = torch.randn(vshape, device="cuda", dtype=dt, requires_grad=True)
+    ls = m.log_scales.detach().to(dt).clone().requires_grad_()
+    w0 = m.w0.detach().to(dt).clone().requires_grad_()
+    gy = torch.randn((hv, banks, R, N) if (heads or banks > 1) else (R, N), device="cuda", dtype=dt)
+
+    fdwt.config.sweep_backward = sweep
+    got = _grads(lambda x, V, ls, w0: spectral_softmax_params(x, m.plan, ls, w0, V, nch, 0.1, heads),
+                 x, V, ls, w0, gy)
+    cpu = [t.detach().cpu().requires_grad_() for t in (x, V, ls, w0)]
+    ref = _grads(lambda x, V, ls, w0: spectral_softmax_params(x, m.plan, ls, w0, V, nch, 0.1, heads),
+                 *cpu, gy.cpu())
+    for a, b in zip(got, ref):
+        torch.testing.assert_close(a.cpu(), b, atol=1e-10 * b.abs().max().item(), rtol=0)
+
+
+def test_bank_plan_shares_octaves():
+    # scale k of every bank sits in one octave (the finest), stages list the banks in order
+    scales = [1.0, 3.0, 9.0, 27.0]
+    plan = MorletPlan(scales + [s * 1.9 for s in scales], banks=2)
+    oct_ = plan.octaves
+    assert oct_[:4] == oct_[4:]
+    assert oct_[:4] == MorletPlan(scales).octaves
+    for st in plan.stages:
+        k = len(st.scale_idx) // 2
+        assert all(i < 4 for i in st.scale_idx[:k]) and all(i >= 4 for i in st.scale_idx[k:])
